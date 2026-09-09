@@ -1,0 +1,41 @@
+{% extends "admin/base.html" %}
+{% block title %}Главная — Админка{% endblock %}
+{% block content %}
+<div class="admin-page-heading"><div><span class="eyebrow">Сводка</span><h1>Управление магазином</h1><p>Товары, прайсы и новые заказы в одном месте.</p></div></div>
+<div class="stats-grid">
+  <div class="stat-card"><span>Активных товаров</span><strong>{{ stats.active_products }}</strong><a href="{{ url_for('admin_products', active='1') }}">Открыть каталог</a></div>
+  <div class="stat-card"><span>Новых заказов</span><strong>{{ stats.new_orders }}</strong><a href="{{ url_for('admin_orders', status='new') }}">Посмотреть</a></div>
+  <div class="stat-card"><span>Всего заказов</span><strong>{{ stats.orders_total }}</strong><a href="{{ url_for('admin_orders') }}">Все заказы</a></div>
+  <div class="stat-card"><span>Сумма заказов</span><strong>{{ stats.revenue_cents|money }}</strong><small>без отменённых</small></div>
+</div>
+<div class="admin-dashboard-grid">
+  <section class="admin-card import-card">
+    <div class="admin-card-heading"><div><span class="eyebrow">Автообновление каталога</span><h2>Загрузить прайсы XLSX</h2></div><span class="file-pill">до 10 файлов</span></div>
+    <p class="muted">Система определит листы, найдёт колонки по заголовкам, извлечёт встроенные фото и обновит товары по штрихкоду.</p>
+    <form class="import-form" method="post" action="{{ url_for('admin_import') }}" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label class="dropzone js-dropzone">
+        <input class="js-file-input" type="file" name="files" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required>
+        <span class="dropzone-icon">⇧</span><strong>Перетащите Excel сюда</strong><small class="js-file-label">или нажмите, чтобы выбрать файлы</small>
+      </label>
+      <div class="import-options">
+        <label class="field"><span>Коэффициент цены</span><input name="price_multiplier" inputmode="decimal" value="{{ price_multiplier }}" required><small>1.0 — цена из прайса; 1.25 — наценка 25%</small></label>
+        <label class="check-row"><input type="checkbox" name="deactivate_missing" value="1"><span><strong>Скрывать отсутствующие товары</strong><small>Товары бренда, которых нет в новом файле, станут неактивными.</small></span></label>
+      </div>
+      <button class="button button-primary button-large" type="submit">Импортировать и обновить каталог</button>
+    </form>
+  </section>
+  <section class="admin-card">
+    <div class="admin-card-heading"><div><span class="eyebrow">Последние</span><h2>Заказы</h2></div><a href="{{ url_for('admin_orders') }}">Все →</a></div>
+    {% if recent_orders %}
+      <div class="admin-list">{% for order in recent_orders %}<a class="order-list-item" href="{{ url_for('admin_order_detail', order_id=order.id) }}"><span><strong>{{ order.order_number }}</strong><small>{{ order.customer_name }} · {{ order.created_at[:16]|replace('T', ' ') }}</small></span><span class="status status-{{ order.status }}">{{ order_statuses.get(order.status, order.status) }}</span><b>{{ order.total_cents|money }}</b></a>{% endfor %}</div>
+    {% else %}<div class="admin-empty">Заказов пока нет.</div>{% endif %}
+  </section>
+</div>
+<section class="admin-card admin-section-gap">
+  <div class="admin-card-heading"><div><span class="eyebrow">История</span><h2>Последние импорты</h2></div></div>
+  {% if import_runs %}
+  <div class="table-wrap"><table class="admin-table"><thead><tr><th>Дата</th><th>Файл</th><th>Добавлено</th><th>Обновлено</th><th>Без изменений</th><th>Скрыто</th><th>Фото</th></tr></thead><tbody>{% for run in import_runs %}<tr><td>{{ run.created_at[:16]|replace('T',' ') }}</td><td><strong>{{ run.filename }}</strong></td><td>{{ run.inserted }}</td><td>{{ run.updated }}</td><td>{{ run.unchanged }}</td><td>{{ run.deactivated }}</td><td>{{ run.image_count }}</td></tr>{% endfor %}</tbody></table></div>
+  {% else %}<div class="admin-empty">Загрузите первый прайс — здесь появится отчёт.</div>{% endif %}
+</section>
+{% endblock %}

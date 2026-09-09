@@ -1,0 +1,17 @@
+{% extends "admin/base.html" %}
+{% block title %}{{ order.order_number }} — Админка{% endblock %}
+{% block content %}
+<div class="admin-page-heading"><div><a class="back-link" href="{{ url_for('admin_orders') }}">← Все заказы</a><span class="eyebrow">Заказ</span><h1>{{ order.order_number }}</h1><p>Создан {{ order.created_at[:16]|replace('T',' ') }}</p></div><span class="status status-large status-{{ order.status }}">{{ order_statuses.get(order.status, order.status) }}</span></div>
+<div class="order-detail-grid">
+  <section class="admin-card">
+    <div class="admin-card-heading"><h2>Состав заказа</h2></div>
+    <div class="order-items-admin">{% for item in items %}<div><span><strong>{{ item.title }}</strong><small>Штрихкод: {{ item.barcode }} · {{ item.unit_price_cents|money }} × {{ item.quantity }}</small></span><b>{{ item.subtotal_cents|money }}</b></div>{% endfor %}</div>
+    <div class="admin-order-total"><span>Итого</span><strong>{{ order.total_cents|money }}</strong></div>
+  </section>
+  <aside class="admin-card customer-card">
+    <div class="admin-card-heading"><h2>Клиент</h2></div>
+    <dl class="customer-facts"><div><dt>Имя</dt><dd>{{ order.customer_name }}</dd></div><div><dt>Телефон</dt><dd><a href="tel:{{ order.phone }}">{{ order.phone }}</a></dd></div>{% if order.telegram %}<div><dt>Telegram</dt><dd>{{ order.telegram }}</dd></div>{% endif %}<div><dt>Получение</dt><dd>{{ delivery_methods.get(order.delivery_method, order.delivery_method) }}</dd></div>{% if order.address %}<div><dt>Адрес</dt><dd>{{ order.address }}</dd></div>{% endif %}<div><dt>Оплата</dt><dd>{{ payment_methods.get(order.payment_method, order.payment_method) }}</dd></div>{% if order.personal_data_consent %}<div><dt>Согласие ПД</dt><dd>Получено · версия {{ order.privacy_policy_version }}{% if order.personal_data_consent_at %}<br>{{ order.personal_data_consent_at[:19]|replace('T',' ') }} UTC{% endif %}</dd></div>{% else %}<div><dt>Согласие ПД</dt><dd>Не зафиксировано (старый заказ)</dd></div>{% endif %}{% if order.comment %}<div><dt>Комментарий</dt><dd>{{ order.comment }}</dd></div>{% endif %}</dl>
+    <form class="status-form" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label class="field"><span>Статус заказа</span><select name="status">{% for key, label in order_statuses.items() %}<option value="{{ key }}" {{ 'selected' if order.status == key else '' }}>{{ label }}</option>{% endfor %}</select></label><button class="button button-primary button-block" type="submit">Сохранить статус</button></form>
+  </aside>
+</div>
+{% endblock %}

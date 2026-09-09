@@ -1,0 +1,36 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime database and SQLite sidecars
+data/shop.db
+data/shop.db-*
+data/*.sqlite
+data/*.sqlite3
+
+# Runtime uploads / extracted product images
+data/media/*
+!data/media/.gitkeep
+data/imports/*
+!data/imports/.gitkeep
+
+# Supplier price lists: do not commit by default
+*.xlsx
+*.xlsm
+*.xls
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

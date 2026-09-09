@@ -1,0 +1,33 @@
+<article class="product-card">
+  <a class="product-image-wrap" href="{{ url_for('product_detail', product_id=product.id) }}">
+    {% if product.badge %}<span class="product-badge">{{ product.badge }}</span>{% endif %}
+    <img class="product-image" src="{{ product.image }}" alt="{{ product.title }}" loading="lazy" decoding="async">
+  </a>
+  <div class="product-card-body">
+    <div class="product-meta"><span>{{ product.brand }}</span><span>{{ product.category }}</span></div>
+    <h3><a href="{{ url_for('product_detail', product_id=product.id) }}">{{ product.model }}</a></h3>
+    <div class="product-spec-line">
+      {% if product.color %}<span>{{ product.color }}</span>{% endif %}
+      <span>Код {{ product.barcode }}</span>
+    </div>
+    <div class="product-card-bottom">
+      <div class="product-price-stack">
+        <strong class="product-price">{{ product.price_cents|money }}</strong>
+        {% if product.box_qty and product.box_qty != '-' %}<small>в коробке: {{ product.box_qty }} шт.</small>{% endif %}
+      </div>
+      <div
+        class="product-qty product-qty-compact js-product-quantity"
+        data-product-id="{{ product.id }}"
+        data-title="{{ product.title }}"
+        data-price-cents="{{ product.price_cents }}"
+        data-image="{{ product.image }}"
+        data-barcode="{{ product.barcode }}"
+        aria-label="Количество {{ product.title }} в корзине"
+      >
+        <button type="button" data-product-qty-action="minus" aria-label="Уменьшить количество {{ product.title }}">−</button>
+        <input class="js-product-quantity-input" type="number" inputmode="numeric" min="0" max="999" step="1" value="0" aria-label="Количество {{ product.title }} в корзине">
+        <button type="button" data-product-qty-action="plus" aria-label="Увеличить количество {{ product.title }}">+</button>
+      </div>
+    </div>
+  </div>
+</article>

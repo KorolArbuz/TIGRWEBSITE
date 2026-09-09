@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Каталог — {{ store_name }}{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="container hero-grid">
+    <div class="hero-copy">
+      <span class="eyebrow">Прайс обновляется из Excel</span>
+      <h1>Техника и аксессуары<br><em>в одном каталоге</em></h1>
+      <p>Выбирайте позиции, указывайте количество и оформляйте заказ. Менеджер проверит наличие и свяжется с вами.</p>
+      <div class="hero-stats">
+        <div><strong>{{ product_count }}</strong><span>товаров</span></div>
+        <div><strong>{{ brands|length }}</strong><span>бренда</span></div>
+        <div><strong>2+</strong><span>фото в карточке</span></div>
+      </div>
+    </div>
+    <form class="hero-search" method="get" action="{{ url_for('catalog') }}">
+      <label for="catalog-search">Найти товар</label>
+      <div class="search-field">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.3-4.3m2.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z"/></svg>
+        <input id="catalog-search" name="q" value="{{ query }}" placeholder="Модель, категория или штрихкод">
+        <button type="submit">Найти</button>
+      </div>
+      <div class="quick-brands">
+        <span>Бренд:</span>
+        <a class="{{ 'is-active' if not selected_brand else '' }}" href="{{ url_for('catalog', q=query, category=selected_category, sort=sort) }}">Все</a>
+        {% for item in brands %}
+          <a class="{{ 'is-active' if selected_brand == item.brand else '' }}" href="{{ url_for('catalog', q=query, brand=item.brand, category=selected_category, sort=sort) }}">{{ item.brand }} <small>{{ item.count }}</small></a>
+        {% endfor %}
+      </div>
+    </form>
+  </div>
+</section>
+
+<section class="catalog-section">
+  <div class="container">
+    <div class="category-strip" aria-label="Категории">
+      <a class="category-chip {{ 'is-active' if not selected_category else '' }}" href="{{ url_for('catalog', q=query, brand=selected_brand, sort=sort) }}">Все категории</a>
+      {% for item in categories %}
+        <a class="category-chip {{ 'is-active' if selected_category == item.category else '' }}" href="{{ url_for('catalog', q=query, brand=selected_brand, category=item.category, sort=sort) }}">{{ item.category }} <small>{{ item.count }}</small></a>
+      {% endfor %}
+    </div>
+
+    <div class="catalog-toolbar">
+      <div>
+        <span class="eyebrow">Каталог</span>
+        <h2>{% if query %}Результаты по запросу «{{ query }}»{% elif selected_category %}{{ selected_category }}{% else %}Все товары{% endif %}</h2>
+        <p>Найдено: {{ total }}</p>
+      </div>
+      <form method="get" class="sort-form js-auto-submit-form">
+        <input type="hidden" name="q" value="{{ query }}">
+        <input type="hidden" name="brand" value="{{ selected_brand }}">
+        <input type="hidden" name="category" value="{{ selected_category }}">
+        <label for="sort">Сортировка</label>
+        <select id="sort" name="sort" class="js-auto-submit">
+          <option value="popular" {{ 'selected' if sort == 'popular' else '' }}>Сначала рекомендуемые</option>
+          <option value="new" {{ 'selected' if sort == 'new' else '' }}>Сначала новинки</option>
+          <option value="price_asc" {{ 'selected' if sort == 'price_asc' else '' }}>Сначала дешевле</option>
+          <option value="price_desc" {{ 'selected' if sort == 'price_desc' else '' }}>Сначала дороже</option>
+          <option value="name" {{ 'selected' if sort == 'name' else '' }}>По названию</option>
+        </select>
+      </form>
+    </div>
+
+    {% if products %}
+      <div class="product-grid">
+        {% for product in products %}{% include "_product_card.html" %}{% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-results">
+        <span>🔎</span><h3>Ничего не нашли</h3><p>Попробуйте сократить запрос или сбросить фильтры.</p>
+        <a class="button button-primary" href="{{ url_for('catalog') }}">Показать весь каталог</a>
+      </div>
+    {% endif %}
+
+    {% if pages > 1 %}
+      <nav class="pagination" aria-label="Страницы каталога">
+        {% if page > 1 %}<a href="{{ url_for('catalog', q=query, brand=selected_brand, category=selected_category, sort=sort, page=page-1) }}">←</a>{% endif %}
+        {% for number in range([1, page-2]|max, [pages, page+2]|min + 1) %}
+          <a class="{{ 'is-active' if number == page else '' }}" href="{{ url_for('catalog', q=query, brand=selected_brand, category=selected_category, sort=sort, page=number) }}">{{ number }}</a>
+        {% endfor %}
+        {% if page < pages %}<a href="{{ url_for('catalog', q=query, brand=selected_brand, category=selected_category, sort=sort, page=page+1) }}">→</a>{% endif %}
+      </nav>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

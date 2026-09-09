@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход в админку — {{ store_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}">
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <a class="brand-mark login-brand" href="{{ url_for('catalog') }}"><span class="brand-symbol">X</span><span><strong>{{ store_name }}</strong><small>панель управления</small></span></a>
+    <span class="eyebrow">Только для сотрудников</span><h1>Вход в админку</h1><p>Введите пароль, указанный в файле <code>.env</code>.</p>
+    {% if flashes %}{% for category, message in flashes %}<div class="flash flash-{{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="next" value="{{ next_url }}">
+      <label class="field"><span>Пароль</span><input name="password" type="password" autocomplete="current-password" required autofocus></label>
+      <button class="button button-primary button-block button-large" type="submit">Войти</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+{% block title %}Ошибка {{ code }} — {{ store_name }}{% endblock %}
+{% block content %}
+<section class="error-section"><div class="container error-card"><strong>{{ code }}</strong><h1>{{ message }}</h1><a class="button button-primary" href="{{ url_for('catalog') }}">В каталог</a></div></section>
+{% endblock %}

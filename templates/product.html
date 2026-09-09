@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}{{ product.title }} — {{ store_name }}{% endblock %}
+{% block content %}
+<section class="product-page-section">
+  <div class="container">
+    <nav class="breadcrumbs" aria-label="Хлебные крошки">
+      <a href="{{ url_for('catalog') }}">Каталог</a><span>/</span>
+      <a href="{{ url_for('catalog', category=product.category) }}">{{ product.category }}</a><span>/</span>
+      <span>{{ product.model }}</span>
+    </nav>
+    <div class="product-detail-grid">
+      <div class="gallery">
+        <div class="gallery-main">
+          {% if product.badge %}<span class="product-badge">{{ product.badge }}</span>{% endif %}
+          <img class="js-gallery-main" src="{{ product.image }}" alt="{{ product.title }}">
+        </div>
+        {% if product.images|length > 1 %}
+          <div class="gallery-thumbs">
+            {% for image in product.images %}
+              <button class="gallery-thumb js-gallery-thumb {{ 'is-active' if loop.first else '' }}" type="button" data-image="{{ image }}">
+                <img src="{{ image }}" alt="Фото {{ loop.index }}" loading="lazy">
+              </button>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+      <div class="product-info-panel">
+        <div class="product-meta"><span>{{ product.brand }}</span><span>{{ product.category }}</span></div>
+        <h1>{{ product.model }}</h1>
+        {% if product.color %}<p class="detail-color">Цвет: <strong>{{ product.color }}</strong></p>{% endif %}
+        <strong class="detail-price">{{ product.price_cents|money }}</strong>
+        <div class="availability"><i></i><span>Доступно для заказа, наличие подтвердит менеджер</span></div>
+        <div class="detail-quantity-block">
+          <div class="detail-quantity-copy">
+            <strong>Количество в корзине</strong>
+            <span>Используйте − / + или введите число</span>
+          </div>
+          <div
+            class="product-qty product-qty-large js-product-quantity"
+            data-product-id="{{ product.id }}"
+            data-title="{{ product.title }}"
+            data-price-cents="{{ product.price_cents }}"
+            data-image="{{ product.image }}"
+            data-barcode="{{ product.barcode }}"
+          >
+            <button type="button" data-product-qty-action="minus" aria-label="Уменьшить количество">−</button>
+            <input class="js-product-quantity-input" type="number" inputmode="numeric" min="0" max="999" step="1" value="0" aria-label="Количество товара в корзине">
+            <button type="button" data-product-qty-action="plus" aria-label="Увеличить количество">+</button>
+          </div>
+        </div>
+        <dl class="product-facts">
+          <div><dt>Штрихкод</dt><dd>{{ product.barcode }}</dd></div>
+          {% if product.box_qty %}<div><dt>Упаковка</dt><dd>{{ product.box_qty }}{% if product.box_qty != '-' %} шт. в коробке{% endif %}</dd></div>{% endif %}
+          <div><dt>Бренд</dt><dd>{{ product.brand }}</dd></div>
+        </dl>
+        {% if product.description %}
+          <div class="description-box"><h2>Описание</h2><p>{{ product.description }}</p></div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</section>
+{% if related %}
+<section class="related-section">
+  <div class="container">
+    <div class="section-heading"><span class="eyebrow">Может подойти</span><h2>Похожие товары</h2></div>
+    <div class="product-grid related-grid">{% for product in related %}{% include "_product_card.html" %}{% endfor %}</div>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

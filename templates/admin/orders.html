@@ -1,0 +1,13 @@
+{% extends "admin/base.html" %}
+{% block title %}Заказы — Админка{% endblock %}
+{% block content %}
+<div class="admin-page-heading"><div><span class="eyebrow">Продажи</span><h1>Заказы</h1><p>Заявки клиентов и их текущие статусы.</p></div><a class="button button-secondary" href="{{ url_for('admin_orders_csv') }}">Скачать CSV</a></div>
+<form class="admin-filterbar" method="get">
+  <input name="q" value="{{ query }}" placeholder="Номер, клиент или телефон">
+  <select name="status"><option value="">Все статусы</option>{% for key, label in order_statuses.items() %}<option value="{{ key }}" {{ 'selected' if selected_status == key else '' }}>{{ label }}</option>{% endfor %}</select>
+  <button class="button button-primary" type="submit">Найти</button><a class="button button-ghost" href="{{ url_for('admin_orders') }}">Сбросить</a>
+</form>
+<section class="admin-card">
+  {% if orders %}<div class="table-wrap"><table class="admin-table orders-table"><thead><tr><th>Заказ</th><th>Дата</th><th>Клиент</th><th>Телефон</th><th>Получение</th><th>Статус</th><th>Сумма</th></tr></thead><tbody>{% for order in orders %}<tr class="clickable-row" data-href="{{ url_for('admin_order_detail', order_id=order.id) }}"><td><a href="{{ url_for('admin_order_detail', order_id=order.id) }}"><strong>{{ order.order_number }}</strong></a></td><td>{{ order.created_at[:16]|replace('T',' ') }}</td><td>{{ order.customer_name }}</td><td><a href="tel:{{ order.phone }}">{{ order.phone }}</a></td><td>{{ delivery_methods.get(order.delivery_method, order.delivery_method) }}</td><td><span class="status status-{{ order.status }}">{{ order_statuses.get(order.status, order.status) }}</span></td><td><strong>{{ order.total_cents|money }}</strong></td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="admin-empty">По заданным фильтрам заказов нет.</div>{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Оформление заказа — {{ store_name }}{% endblock %}
+{% block content %}
+<section class="checkout-section">
+  <div class="container">
+    <nav class="breadcrumbs"><a href="{{ url_for('catalog') }}">Каталог</a><span>/</span><span>Оформление</span></nav>
+    <div class="checkout-heading"><span class="eyebrow">Последний шаг</span><h1>Оформление заказа</h1><p>Цена и доступность будут повторно проверены при отправке формы.</p></div>
+    <form class="checkout-grid js-checkout-form" method="post" action="{{ url_for('create_order') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input class="js-cart-json" type="hidden" name="cart_json" value="[]">
+      <div class="checkout-form-card">
+        <div class="form-section">
+          <div class="form-section-number">1</div><div><h2>Контакты</h2><p>Менеджер свяжется для подтверждения.</p></div>
+        </div>
+        <div class="field-grid">
+          <label class="field"><span>Имя *</span><input name="customer_name" autocomplete="name" required minlength="2" maxlength="100" placeholder="Денис"></label>
+          <label class="field"><span>Телефон *</span><input name="phone" type="tel" autocomplete="tel" required maxlength="40" placeholder="+7 999 000-00-00"></label>
+          <label class="field field-full"><span>Telegram</span><input name="telegram" maxlength="80" placeholder="@username"></label>
+        </div>
+        <div class="form-divider"></div>
+        <div class="form-section">
+          <div class="form-section-number">2</div><div><h2>Получение</h2><p>Выберите удобный вариант.</p></div>
+        </div>
+        <div class="choice-grid">
+          <label class="choice-card"><input class="js-delivery-choice" type="radio" name="delivery_method" value="pickup" checked><span><strong>Самовывоз</strong><small>Адрес уточнит менеджер</small></span></label>
+          <label class="choice-card"><input class="js-delivery-choice" type="radio" name="delivery_method" value="courier"><span><strong>Доставка</strong><small>Стоимость рассчитывается отдельно</small></span></label>
+        </div>
+        <label class="field field-full js-address-field" hidden><span>Адрес доставки *</span><textarea name="address" maxlength="500" rows="3" placeholder="Город, улица, дом, квартира"></textarea></label>
+        <div class="form-divider"></div>
+        <div class="form-section">
+          <div class="form-section-number">3</div><div><h2>Оплата и комментарий</h2><p>Онлайн-списания на этом этапе нет.</p></div>
+        </div>
+        <div class="choice-grid">
+          <label class="choice-card"><input type="radio" name="payment_method" value="manager" checked><span><strong>После подтверждения</strong><small>Менеджер сообщит реквизиты</small></span></label>
+          <label class="choice-card"><input type="radio" name="payment_method" value="cash"><span><strong>При получении</strong><small>Если доступно для вашего заказа</small></span></label>
+        </div>
+        <label class="field field-full"><span>Комментарий</span><textarea name="comment" maxlength="1000" rows="4" placeholder="Нужный цвет, удобное время звонка или другое пожелание"></textarea></label>
+      </div>
+      <aside class="order-summary-card">
+        <div class="summary-heading"><span class="eyebrow">Ваш заказ</span><h2>Состав заказа</h2></div>
+        <div class="checkout-items js-checkout-items"></div>
+        <div class="checkout-empty js-checkout-empty"><strong>Корзина пуста</strong><p>Вернитесь в каталог и добавьте товары.</p><a href="{{ url_for('catalog') }}">Перейти в каталог</a></div>
+        <div class="summary-total js-checkout-total-wrap" hidden><span>Итого</span><strong class="js-checkout-total">0 ₽</strong></div>
+        <label class="consent-check">
+          <input type="checkbox" name="personal_data_consent" value="1" required>
+          <span>Я даю согласие на обработку персональных данных для оформления и исполнения заказа и принимаю <a href="{{ url_for('privacy_policy') }}" target="_blank" rel="noopener">Политику обработки персональных данных</a>.</span>
+        </label>
+        <button class="button button-primary button-block button-large js-submit-order" type="submit" disabled>Оформить заказ</button>
+        <p class="legal-note">Отправляя заказ, вы создаёте заявку. Финальное наличие, доставка и оплата подтверждаются менеджером.</p>
+      </aside>
+    </form>
+  </div>
+</section>
+{% endblock %}

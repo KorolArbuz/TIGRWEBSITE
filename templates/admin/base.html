@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>{% block title %}Админка — {{ store_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}">
+  <script defer src="{{ url_for('static', path='js/admin.js') }}"></script>
+</head>
+<body class="admin-body">
+  <header class="admin-header">
+    <div class="container admin-header-inner">
+      <a class="brand-mark" href="{{ url_for('admin_dashboard') }}">
+        <span class="brand-symbol">X</span>
+        <span><strong>{{ store_name }}</strong><small>панель управления</small></span>
+      </a>
+      <nav class="admin-nav">
+        <a class="{{ 'is-active' if endpoint == 'admin_dashboard' else '' }}" href="{{ url_for('admin_dashboard') }}">Главная</a>
+        <a class="{{ 'is-active' if endpoint in ['admin_orders', 'admin_order_detail'] else '' }}" href="{{ url_for('admin_orders') }}">Заказы</a>
+        <a class="{{ 'is-active' if endpoint in ['admin_products', 'admin_product_update'] else '' }}" href="{{ url_for('admin_products') }}">Товары</a>
+        <a href="{{ url_for('catalog') }}" target="_blank" rel="noopener">Открыть сайт ↗</a>
+      </nav>
+      <form method="post" action="{{ url_for('admin_logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="button button-ghost button-small" type="submit">Выйти</button>
+      </form>
+    </div>
+  </header>
+  {% if flashes %}<div class="container flash-stack admin-flashes">{% for category, message in flashes %}<div class="flash flash-{{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}
+  <main class="admin-main container">{% block content %}{% endblock %}</main>
+</body>
+</html>

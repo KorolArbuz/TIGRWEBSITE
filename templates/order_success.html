@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Заказ {{ order.order_number }} оформлен — {{ store_name }}{% endblock %}
+{% block content %}
+<section class="success-section">
+  <div class="container success-card">
+    <div class="success-icon"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></div>
+    <span class="eyebrow">Заявка принята</span>
+    <h1>Заказ оформлен</h1>
+    <p>Номер заказа <strong>{{ order.order_number }}</strong>. Менеджер свяжется с вами по телефону {{ order.phone }}.</p>
+    <div class="success-order">
+      {% for item in items %}
+        <div><span>{{ item.title }} × {{ item.quantity }}</span><strong>{{ item.subtotal_cents|money }}</strong></div>
+      {% endfor %}
+      <div class="success-total"><span>Итого</span><strong>{{ order.total_cents|money }}</strong></div>
+    </div>
+    <div class="success-actions"><a class="button button-primary" href="{{ url_for('catalog') }}">Вернуться в каталог</a></div>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <meta name="description" content="Каталог техники и аксессуаров с оформлением заказа">
+  <title>{% block title %}{{ store_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}">
+  <script defer src="{{ url_for('static', path='js/shop.js') }}"></script>
+</head>
+<body data-clear-cart="{{ '1' if clear_cart|default(false) else '0' }}">
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand-mark" href="{{ url_for('catalog') }}" aria-label="На главную">
+        <span class="brand-symbol">X</span>
+        <span>
+          <strong>{{ store_name }}</strong>
+          <small>техника и аксессуары</small>
+        </span>
+      </a>
+      <nav class="desktop-nav" aria-label="Основная навигация">
+        <a href="{{ url_for('catalog') }}">Каталог</a>
+        {% if store_phone %}<a href="tel:{{ store_phone|replace(' ', '')|replace('-', '') }}">{{ store_phone }}</a>{% endif %}
+        {% if session.get('admin_authenticated') %}<a href="{{ url_for('admin_dashboard') }}">Админка</a>{% endif %}
+      </nav>
+      <button class="cart-trigger js-cart-open" type="button" aria-label="Открыть корзину">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 3h2l1.5 10.2a2 2 0 0 0 2 1.8h8.8a2 2 0 0 0 1.9-1.4L21 7H7M9 20a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm8 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/></svg>
+        <span>Корзина</span>
+        <b class="cart-count js-cart-count">0</b>
+      </button>
+    </div>
+  </header>
+
+  {% if flashes %}
+      <div class="container flash-stack" aria-live="polite">
+        {% for category, message in flashes %}
+          <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+  <main>{% block content %}{% endblock %}</main>
+
+  <footer class="site-footer">
+    <div class="container footer-grid">
+      <div>
+        <a class="brand-mark footer-brand" href="{{ url_for('catalog') }}">
+          <span class="brand-symbol">X</span>
+          <span><strong>{{ store_name }}</strong><small>актуальный каталог</small></span>
+        </a>
+      </div>
+      <div class="footer-contact">
+        <span>Заказы подтверждаются менеджером</span>
+        <a href="{{ url_for('privacy_policy') }}">Политика обработки персональных данных</a>
+        {% if store_phone %}<a href="tel:{{ store_phone|replace(' ', '')|replace('-', '') }}">{{ store_phone }}</a>{% endif %}
+        {% if store_telegram %}<a href="https://t.me/{{ store_telegram|replace('@', '') }}">{{ store_telegram }}</a>{% endif %}
+      </div>
+    </div>
+  </footer>
+
+  <button class="drawer-overlay js-cart-close" type="button" aria-label="Закрыть корзину"></button>
+  <aside class="cart-drawer" aria-label="Корзина" aria-hidden="true">
+    <div class="drawer-header">
+      <div>
+        <span class="eyebrow">Ваш заказ</span>
+        <h2>Корзина</h2>
+      </div>
+      <button class="icon-button js-cart-close" type="button" aria-label="Закрыть">
+        <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="cart-items js-cart-items"></div>
+    <div class="cart-empty js-cart-empty">
+      <span class="empty-icon">🛒</span>
+      <strong>Корзина пока пуста</strong>
+      <p>Добавьте товары из каталога — всё сохранится на этом устройстве.</p>
+    </div>
+    <div class="drawer-footer js-cart-footer" hidden>
+      <div class="cart-total-row"><span>Итого</span><strong class="js-cart-total">0 ₽</strong></div>
+      <a class="button button-primary button-block" href="{{ url_for('checkout') }}">Перейти к оформлению</a>
+      <button class="button button-ghost button-block js-cart-clear" type="button">Очистить корзину</button>
+    </div>
+  </aside>
+  <div class="toast js-toast" role="status" aria-live="polite"></div>
+</body>
+</html>
