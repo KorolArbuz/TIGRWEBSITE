@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from shop.database import connect, init_db
+from shop.import_service import import_slot
 from shop.xlsx_importer import import_xlsx
 
 
@@ -23,18 +24,19 @@ def main() -> None:
     args = parser.parse_args()
 
     init_db(args.database)
-    connection = connect(args.database)
-    try:
-        result = import_xlsx(
-            connection,
-            args.file,
-            args.media,
-            original_filename=args.file.name,
-            price_multiplier=args.multiplier,
-            deactivate_missing=args.deactivate_missing,
-        )
-    finally:
-        connection.close()
+    with import_slot(args.media):
+        connection = connect(args.database)
+        try:
+            result = import_xlsx(
+                connection,
+                args.file,
+                args.media,
+                original_filename=args.file.name,
+                price_multiplier=args.multiplier,
+                deactivate_missing=args.deactivate_missing,
+            )
+        finally:
+            connection.close()
     print(result.as_dict())
 
 

@@ -22,7 +22,7 @@
       <nav class="desktop-nav" aria-label="Основная навигация">
         <a href="{{ url_for('catalog') }}">Каталог</a>
         {% if store_phone %}<a href="tel:{{ store_phone|replace(' ', '')|replace('-', '') }}">{{ store_phone }}</a>{% endif %}
-        {% if session.get('admin_authenticated') %}<a href="{{ url_for('admin_dashboard') }}">Админка</a>{% endif %}
+        {% if admin_authenticated %}<a href="{{ url_for('admin_dashboard') }}">Админка</a>{% endif %}
       </nav>
       <button class="cart-trigger js-cart-open" type="button" aria-label="Открыть корзину">
         <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 3h2l1.5 10.2a2 2 0 0 0 2 1.8h8.8a2 2 0 0 0 1.9-1.4L21 7H7M9 20a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm8 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/></svg>

@@ -6,7 +6,8 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 if [ ! -f .env ]; then
-  cp .env.example .env
-  echo "Создан .env. Перед публикацией поменяйте SECRET_KEY и ADMIN_PASSWORD."
+  python3 -m venv .venv
+  .venv/bin/python -m pip install --require-hashes -r requirements.txt
+  .venv/bin/python scripts/setup_security.py --development
 fi
 docker compose up --build

@@ -11,6 +11,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv-*/
+.python/
+.security-tools/
+.uv-cache/
+.security-results/
+.coverage
+htmlcov/
 
 # Runtime database and SQLite sidecars
 data/shop.db

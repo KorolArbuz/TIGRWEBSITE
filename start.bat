@@ -6,6 +6,10 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-if not exist .env copy .env.example .env >nul
+if not exist .env (
+  echo Run start-local.bat once to create local administrator credentials, then retry.
+  pause
+  exit /b 1
+)
 docker compose up --build
 pause

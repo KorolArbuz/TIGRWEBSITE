@@ -3,9 +3,30 @@ services:
     build: .
     container_name: hoco-catalog-shop
     env_file:
-      - .env
+      - path: .env
+        format: raw
+    environment:
+      APP_ENV: development
+      SESSION_COOKIE_SECURE: "false"
+      ALLOWED_HOSTS: localhost,127.0.0.1
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 1536m
+    cpus: 2.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

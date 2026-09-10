@@ -4,20 +4,23 @@ import csv
 import hmac
 import io
 import json
-import logging
 import math
 import os
 import re
 import secrets
-import sqlite3
-from contextlib import closing
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager, closing
+from functools import partial
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+import anyio
+from fastapi import FastAPI, HTTPException, Path as ApiPath, Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.formparsers import MultiPartException
+from python_multipart.exceptions import MultipartParseError, ParseError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -25,10 +28,12 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
 from .database import connect, init_db
-from .telegram import send_order_notification
-from .xlsx_importer import ImportResult, import_xlsx
+from .import_service import ImportBusyError, ImportLimitError, run_imports
+from .orders import CheckoutError, OutboxWorker, create_checkout, normalize_checkout
+from .security import (ADMIN_COOKIE, AdminGate, BoundedFormParser, BoundedMultiPartParser, BodyLimitExceeded,
+                       MultipartBudgetExceeded, SecureFastAPI, create_admin_session,
+                       revoke_sessions, sync_credentials, validate_settings, verify_password)
 
-LOGGER = logging.getLogger(__name__)
 ORDER_STATUSES = {
     "new": "Новый",
     "confirmed": "Подтверждён",
@@ -46,6 +51,7 @@ PAYMENT_METHODS = {
     "cash": "При получении",
 }
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+DatabaseId = Annotated[int, ApiPath(ge=1, le=9223372036854775807)]
 
 
 def _load_local_env(path: Path) -> None:
@@ -71,7 +77,6 @@ def _load_local_env(path: Path) -> None:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_load_local_env(PROJECT_ROOT / ".env")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -108,15 +113,18 @@ def _product_dict(row: Any) -> dict[str, Any]:
         "color": str(row["color"]),
         "box_qty": str(row["box_qty"]),
         "price_cents": int(row["price_cents"]),
-        "source_price_cents": int(row["source_price_cents"]),
         "description": str(row["description"]),
         "badge": str(row["badge"]),
         "images": images,
         "image": images[0] if images else "/static/img/placeholder.svg",
         "active": bool(row["active"]),
         "title": _product_title(row),
-        "updated_at": str(row["updated_at"]),
     }
+
+
+def _admin_product_dict(row: Any) -> dict[str, Any]:
+    return {**_product_dict(row), "source_price_cents": int(row["source_price_cents"]),
+            "updated_at": str(row["updated_at"])}
 
 
 def _money(cents: int | str | None) -> str:
@@ -129,10 +137,15 @@ def _money(cents: int | str | None) -> str:
 
 
 def _safe_next_url(value: str | None) -> str:
-    if not value:
+    if not value or len(value) > 2048 or any(ord(c) < 32 for c in value) or "\\" in value:
         return "/admin"
-    parsed = urlsplit(value)
-    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/admin"):
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return "/admin"
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        return "/admin"
+    if not re.fullmatch(r"/admin(?:/products|/orders(?:/[1-9][0-9]{0,18})?)?", parsed.path):
         return "/admin"
     return parsed.path + (("?" + parsed.query) if parsed.query else "")
 
@@ -140,28 +153,22 @@ def _safe_next_url(value: str | None) -> str:
 def _parse_positive_int(value: Any, *, default: int = 1, maximum: int = 999) -> int:
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(1, min(maximum, parsed))
 
 
 def _parse_price_to_cents(value: str) -> int:
+    if len(value) > 64:
+        raise ValueError("Цена вне допустимого диапазона")
     normalized = value.strip().replace(" ", "").replace(",", ".").replace("₽", "")
     try:
         amount = Decimal(normalized)
     except InvalidOperation as exc:
         raise ValueError("Цена должна быть числом") from exc
-    if amount < 0 or amount > Decimal("100000000"):
+    if not amount.is_finite() or amount < 0 or amount > Decimal("100000000"):
         raise ValueError("Цена вне допустимого диапазона")
     return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-
-def _safe_filename(value: str) -> str:
-    name = Path(value).name
-    stem = Path(name).stem
-    suffix = Path(name).suffix.lower()
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "price"
-    return f"{stem[:80]}{suffix if suffix else '.xlsx'}"
 
 
 def _csv_cell(value: Any) -> str:
@@ -181,17 +188,64 @@ def _ensure_csrf(request: Request) -> str:
 
 
 async def _verified_form(
-    request: Request,
-    *,
-    max_files: int = 10,
-    max_fields: int = 200,
-    max_part_size: int = MAX_UPLOAD_BYTES,
+    request: Request, *, max_files: int = 0, max_fields: int = 20, max_part_size: int = 16384,
 ) -> Any:
-    form = await request.form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
-    expected = str(request.session.get("csrf_token", ""))
-    supplied = str(form.get("csrf_token", ""))
-    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
-        raise HTTPException(status_code=400, detail="Некорректный CSRF-токен. Обновите страницу и повторите действие.")
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+        raise HTTPException(415, "Неподдерживаемый формат формы")
+    expected = request.session.get("csrf_token", "")
+    if not isinstance(expected, str) or not expected:
+        raise HTTPException(400, "Обновите страницу перед отправкой формы")
+    header_token = request.headers.get("x-csrf-token")
+    if header_token is not None and (len(header_token) > 128 or not hmac.compare_digest(
+        expected.encode("utf-8"), header_token.encode("utf-8")
+    )):
+        raise HTTPException(400, "Некорректный CSRF-токен")
+    try:
+        if content_type == "multipart/form-data":
+            parser = BoundedMultiPartParser(request.headers, request.stream(), max_files=max_files,
+                                            max_fields=max_fields, max_part_size=max_part_size)
+            form = await parser.parse()
+        else:
+            form = await BoundedFormParser(request.headers, request.stream(), max_fields=max_fields,
+                                           max_part_size=max_part_size).parse()
+    except (BodyLimitExceeded, MultipartBudgetExceeded) as exc:
+        raise HTTPException(413, "Превышен размер запроса или поля") from exc
+    except MultipartParseError as exc:
+        # python-multipart 0.0.32 exposes header budgets through this general
+        # error class. These exact messages are covered by regression tests.
+        if str(exc) in {"Maximum header size exceeded", "Maximum header count exceeded"}:
+            raise HTTPException(413, "Превышен лимит заголовков multipart") from exc
+        raise HTTPException(400, "Некорректная multipart-форма") from exc
+    except (MultiPartException, ParseError) as exc:
+        raise HTTPException(400, "Некорректная multipart-форма") from exc
+    try:
+        fields = form.multi_items()
+        if sum(not isinstance(value, StarletteUploadFile) for _, value in fields) > max_fields:
+            raise HTTPException(413, "Слишком много полей")
+        seen: set[str] = set()
+        for key, value in fields:
+            if len(key) > 100 or (key in seen and not (max_files and key == "files")):
+                raise HTTPException(400, "Повторяющееся или некорректное поле")
+            seen.add(key)
+            if isinstance(value, StarletteUploadFile):
+                if not max_files or key != "files":
+                    raise HTTPException(400, "Файлы в этой форме не поддерживаются")
+                if (value.size or 0) > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Файл превышает лимит 100 MiB")
+            elif not isinstance(value, str) or len(value.encode("utf-8")) > max_part_size:
+                raise HTTPException(413, "Поле превышает допустимый размер")
+        supplied = form.get("csrf_token", "")
+        if not isinstance(supplied, str) or len(supplied) > 128 or not hmac.compare_digest(
+            expected.encode("utf-8"), supplied.encode("utf-8")
+        ):
+            raise HTTPException(400, "Некорректный CSRF-токен. Обновите страницу.")
+    except BaseException:
+        with anyio.CancelScope(shield=True):
+            await form.close()
+        raise
+    if max_files == 0:
+        await form.close()
     return form
 
 
@@ -207,7 +261,7 @@ def _pop_flashes(request: Request) -> list[list[str]]:
 
 
 def _admin_authenticated(request: Request) -> bool:
-    return bool(request.session.get("admin_authenticated"))
+    return bool(getattr(request.state, "admin_authenticated", False))
 
 
 def _admin_redirect(request: Request) -> RedirectResponse:
@@ -219,12 +273,17 @@ def _admin_redirect(request: Request) -> RedirectResponse:
 
 def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
     root = PROJECT_ROOT
+    if test_config is None:
+        _load_local_env(root / ".env")
     settings: dict[str, Any] = {
-        "SECRET_KEY": os.getenv("SECRET_KEY", "dev-secret-change-before-public-launch"),
+        "APP_ENV": os.getenv("APP_ENV", "production"),
+        "SECRET_KEY": os.getenv("SECRET_KEY", ""),
+        "ADMIN_PASSWORD_HASH": os.getenv("ADMIN_PASSWORD_HASH", ""),
+        "ALLOWED_HOSTS": os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1"),
         "DATABASE_PATH": os.getenv("DATABASE_PATH", str(root / "data" / "shop.db")),
         "UPLOAD_ROOT": os.getenv("UPLOAD_ROOT", str(root / "data" / "media")),
         "IMPORT_ARCHIVE": os.getenv("IMPORT_ARCHIVE", str(root / "data" / "imports")),
-        "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", "change-me-now"),
+        "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", ""),
         "STORE_NAME": os.getenv("STORE_NAME", "ХОКО Каталог"),
         "STORE_PHONE": os.getenv("STORE_PHONE", "+7 999 000-00-00"),
         "STORE_TELEGRAM": os.getenv("STORE_TELEGRAM", ""),
@@ -235,11 +294,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         "PRICE_MULTIPLIER": os.getenv("PRICE_MULTIPLIER", "1.0"),
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
-        "SESSION_COOKIE_SECURE": _env_bool("SESSION_COOKIE_SECURE", False),
+        "SESSION_COOKIE_SECURE": _env_bool("SESSION_COOKIE_SECURE", True),
+        **{key: os.getenv(key, default) for key, default in {
+            "ADMIN_IDLE_SECONDS": 1800, "ADMIN_ABSOLUTE_SECONDS": 28800,
+            "LOGIN_RATE_LIMIT": 20, "LOGIN_RATE_WINDOW": 300,
+            "CHECKOUT_RATE_LIMIT": 60, "CHECKOUT_RATE_WINDOW": 600,
+        }.items()},
         "PER_PAGE": 36,
     }
     if test_config:
         settings.update(test_config)
+    validate_settings(settings)
     if not str(settings.get("LEGAL_OPERATOR_NAME", "")).strip():
         settings["LEGAL_OPERATOR_NAME"] = settings["STORE_NAME"]
 
@@ -247,7 +312,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
     Path(settings["IMPORT_ARCHIVE"]).mkdir(parents=True, exist_ok=True)
     init_db(settings["DATABASE_PATH"])
 
-    app = FastAPI(title="ХОКО Каталог", docs_url=None, redoc_url=None)
+    sync_credentials(settings)
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        worker = OutboxWorker(settings["DATABASE_PATH"], str(settings["TELEGRAM_BOT_TOKEN"]),
+                              str(settings["TELEGRAM_CHAT_ID"]))
+        worker.start()
+        try:
+            yield
+        finally:
+            await anyio.to_thread.run_sync(worker.stop)
+
+    app = SecureFastAPI(title="ХОКО Каталог", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.login_limiter = anyio.CapacityLimiter(2)
+    app.state.import_limiter = anyio.CapacityLimiter(1)
+    app.add_middleware(AdminGate, settings=settings)
     app.state.settings = settings
     app.add_middleware(
         SessionMiddleware,
@@ -256,6 +335,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         https_only=bool(settings["SESSION_COOKIE_SECURE"]),
         max_age=60 * 60 * 24 * 14,
     )
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings["ALLOWED_HOSTS"], www_redirect=False)
     app.mount("/static", StaticFiles(directory=str(root / "static")), name="static")
 
     templates = Jinja2Templates(directory=str(root / "templates"))
@@ -286,6 +366,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             "request": request,
             "url_for": template_url_for,
             "session": request.session,
+            "admin_authenticated": _admin_authenticated(request),
             "flashes": _pop_flashes(request),
             "csrf_token": lambda: _ensure_csrf(request),
             "store_name": settings["STORE_NAME"],
@@ -302,37 +383,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         }
         base_context.update(context)
         return templates.TemplateResponse(request=request, name=name, context=base_context, status_code=status_code)
-
-    @app.middleware("http")
-    async def security_middleware(request: Request, call_next: Any) -> Response:
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > MAX_UPLOAD_BYTES:
-                    response = HTMLResponse(
-                        "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\">"
-                        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                        "<title>Файл слишком большой</title>"
-                        "<body><main><h1>Файл слишком большой</h1>"
-                        "<p>Лимит загрузки — 100 МБ.</p><a href=\"/admin\">Вернуться в админку</a>"
-                        "</main></body></html>",
-                        status_code=413,
-                    )
-                    response.headers["X-Content-Type-Options"] = "nosniff"
-                    response.headers["X-Frame-Options"] = "DENY"
-                    return response
-            except ValueError:
-                pass
-        response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        response.headers.setdefault(
-            "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
-            "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
-        )
-        return response
 
     @app.get("/", response_class=HTMLResponse, name="catalog")
     def catalog(request: Request) -> HTMLResponse:
@@ -366,12 +416,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             "popular": "CASE WHEN badge <> '' THEN 0 ELSE 1 END, brand ASC, category ASC, model ASC",
         }.get(sort, "CASE WHEN badge <> '' THEN 0 ELSE 1 END, brand ASC, category ASC, model ASC")
         where_sql = " AND ".join(where)
+        # Clauses and ordering come exclusively from constants above; values use bound parameters.
         with closing(connect(settings["DATABASE_PATH"])) as db:
-            total = int(db.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params).fetchone()[0])
+            total = int(db.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params).fetchone()[0])  # nosec B608
             pages = max(1, math.ceil(total / per_page))
             page = min(page, pages)
             rows = db.execute(
-                f"SELECT * FROM products WHERE {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                f"SELECT * FROM products WHERE {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?",  # nosec B608
                 [*params, per_page, (page - 1) * per_page],
             ).fetchall()
             products = [_product_dict(row) for row in rows]
@@ -400,7 +451,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         )
 
     @app.get("/product/{product_id}", response_class=HTMLResponse, name="product_detail")
-    def product_detail(request: Request, product_id: int) -> HTMLResponse:
+    def product_detail(request: Request, product_id: DatabaseId) -> HTMLResponse:
         with closing(connect(settings["DATABASE_PATH"])) as db:
             row = db.execute("SELECT * FROM products WHERE id = ? AND active = 1", (product_id,)).fetchone()
             if row is None:
@@ -420,20 +471,26 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
     @app.get("/api/products", response_class=JSONResponse, name="api_products")
     def api_products(request: Request) -> JSONResponse:
         raw_ids = request.query_params.get("ids", "")
+        if len(raw_ids) > 2100:
+            raise HTTPException(400, "Слишком длинный список ID")
         ids: list[int] = []
-        for raw in raw_ids.split(",")[:100]:
-            try:
+        if raw_ids:
+            raw_values = raw_ids.split(",")
+            if len(raw_values) > 100:
+                raise HTTPException(400, "Слишком много ID")
+            for raw in raw_values:
+                if not re.fullmatch(r"[1-9][0-9]{0,18}", raw) or int(raw) > 9223372036854775807:
+                    raise HTTPException(400, "Некорректный ID")
                 value = int(raw)
-            except ValueError:
-                continue
-            if value > 0 and value not in ids:
-                ids.append(value)
+                if value not in ids:
+                    ids.append(value)
         if not ids:
             return JSONResponse({"products": []})
         placeholders = ",".join("?" for _ in ids)
+        # Only the number of placeholders is interpolated, never an ID or other input.
         with closing(connect(settings["DATABASE_PATH"])) as db:
             rows = db.execute(
-                f"SELECT * FROM products WHERE id IN ({placeholders}) AND active = 1", ids
+                f"SELECT * FROM products WHERE id IN ({placeholders}) AND active = 1", ids  # nosec B608
             ).fetchall()
         by_id = {int(row["id"]): _product_dict(row) for row in rows}
         return JSONResponse({"products": [by_id[item_id] for item_id in ids if item_id in by_id]})
@@ -444,171 +501,25 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.get("/checkout", response_class=HTMLResponse, name="checkout")
     def checkout(request: Request) -> HTMLResponse:
-        return render(request, "checkout.html")
+        request.session.setdefault("checkout_scope", secrets.token_urlsafe(32))
+        return render(request, "checkout.html", idempotency_key=secrets.token_urlsafe(32))
 
     @app.post("/checkout", name="create_order")
     async def create_order(request: Request) -> RedirectResponse:
         form = await _verified_form(request)
-        customer_name = str(form.get("customer_name", "")).strip()[:100]
-        phone = str(form.get("phone", "")).strip()[:40]
-        telegram = str(form.get("telegram", "")).strip()[:80]
-        delivery_method = str(form.get("delivery_method", "pickup"))
-        payment_method = str(form.get("payment_method", "manager"))
-        address = str(form.get("address", "")).strip()[:500]
-        comment = str(form.get("comment", "")).strip()[:1000]
-        personal_data_consent = str(form.get("personal_data_consent", "")).strip().lower() in {"1", "true", "yes", "on"}
-        cart_raw = str(form.get("cart_json", ""))
-
-        errors: list[str] = []
-        if len(customer_name) < 2:
-            errors.append("Укажите имя")
-        if len(re.sub(r"\D", "", phone)) < 7:
-            errors.append("Укажите корректный телефон")
-        if delivery_method not in DELIVERY_METHODS:
-            errors.append("Некорректный способ получения")
-        if payment_method not in PAYMENT_METHODS:
-            errors.append("Некорректный способ оплаты")
-        if delivery_method == "courier" and len(address) < 5:
-            errors.append("Для доставки нужен адрес")
-        if not personal_data_consent:
-            errors.append("Для оформления заказа необходимо согласие на обработку персональных данных")
+        scope = request.session.get("checkout_scope")
+        if not isinstance(scope, str) or not scope:
+            raise HTTPException(400, "Откройте страницу оформления заказа")
         try:
-            cart_payload = json.loads(cart_raw)
-        except json.JSONDecodeError:
-            cart_payload = []
-        requested: list[tuple[int, int]] = []
-        seen_ids: set[int] = set()
-        if isinstance(cart_payload, list):
-            for item in cart_payload[:100]:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    product_id = int(item.get("id"))
-                    quantity = int(item.get("quantity"))
-                except (TypeError, ValueError):
-                    continue
-                if product_id <= 0 or product_id in seen_ids or not 1 <= quantity <= 999:
-                    continue
-                seen_ids.add(product_id)
-                requested.append((product_id, quantity))
-        if not requested:
-            errors.append("Корзина пуста")
-        if len(requested) > 50:
-            errors.append("В одном заказе допускается не больше 50 разных товаров")
-        if errors:
-            for error in errors:
-                _flash(request, error, "error")
-            return RedirectResponse(url="/checkout", status_code=303)
-
-        ids = [product_id for product_id, _quantity in requested]
-        placeholders = ",".join("?" for _ in ids)
-        with closing(connect(settings["DATABASE_PATH"])) as db:
-            rows = db.execute(
-                f"SELECT * FROM products WHERE id IN ({placeholders}) AND active = 1", ids
-            ).fetchall()
-            products_by_id = {int(row["id"]): row for row in rows}
-            items: list[dict[str, Any]] = []
-            total_cents = 0
-            for product_id, quantity in requested:
-                row = products_by_id.get(product_id)
-                if row is None:
-                    continue
-                unit_price = int(row["price_cents"])
-                subtotal = unit_price * quantity
-                total_cents += subtotal
-                items.append(
-                    {
-                        "product_id": product_id,
-                        "barcode": str(row["barcode"]),
-                        "title": _product_title(row),
-                        "unit_price_cents": unit_price,
-                        "quantity": quantity,
-                        "subtotal_cents": subtotal,
-                    }
-                )
-            if not items:
-                _flash(request, "Товары из корзины больше недоступны. Обновите каталог.", "error")
-                return RedirectResponse(url="/checkout", status_code=303)
-            if len(items) != len(requested):
-                _flash(
-                    request,
-                    "Один или несколько товаров стали недоступны. Корзина обновлена — проверьте её ещё раз.",
-                    "error",
-                )
-                return RedirectResponse(url="/checkout", status_code=303)
-
-            public_token = secrets.token_urlsafe(24)
-            consent_at = datetime.now(timezone.utc).isoformat()
-            try:
-                cursor = db.execute(
-                    """
-                    INSERT INTO orders(
-                        public_token, customer_name, phone, telegram, delivery_method,
-                        address, payment_method, comment, personal_data_consent,
-                        privacy_policy_version, personal_data_consent_at, status, total_cents
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'new', ?)
-                    """,
-                    (
-                        public_token,
-                        customer_name,
-                        phone,
-                        telegram,
-                        delivery_method,
-                        address,
-                        payment_method,
-                        comment,
-                        str(settings["PRIVACY_POLICY_VERSION"]),
-                        consent_at,
-                        total_cents,
-                    ),
-                )
-                order_id = int(cursor.lastrowid)
-                date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
-                order_number = f"XK-{date_part}-{order_id:05d}"
-                db.execute("UPDATE orders SET order_number = ? WHERE id = ?", (order_number, order_id))
-                db.executemany(
-                    """
-                    INSERT INTO order_items(
-                        order_id, product_id, barcode, title, unit_price_cents, quantity, subtotal_cents
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            order_id,
-                            item["product_id"],
-                            item["barcode"],
-                            item["title"],
-                            item["unit_price_cents"],
-                            item["quantity"],
-                            item["subtotal_cents"],
-                        )
-                        for item in items
-                    ],
-                )
-                db.commit()
-            except Exception:
-                db.rollback()
-                raise
-
-        try:
-            send_order_notification(
-                str(settings["TELEGRAM_BOT_TOKEN"]),
-                str(settings["TELEGRAM_CHAT_ID"]),
-                {
-                    "order_number": order_number,
-                    "customer_name": customer_name,
-                    "phone": phone,
-                    "telegram": telegram,
-                    "delivery_method": DELIVERY_METHODS[delivery_method],
-                    "address": address,
-                    "comment": comment,
-                    "total_cents": total_cents,
-                },
-                items,
-            )
-        except Exception as exc:
-            LOGGER.warning("Telegram order notification failed (%s)", type(exc).__name__)
-        return RedirectResponse(url=f"/order/{public_token}", status_code=303)
+            payload = normalize_checkout(form)
+            result = await anyio.to_thread.run_sync(partial(
+                create_checkout, settings["DATABASE_PATH"], scope, str(form.get("idempotency_key", "")),
+                payload, str(settings["PRIVACY_POLICY_VERSION"]),
+                notify=bool(settings["TELEGRAM_BOT_TOKEN"] and settings["TELEGRAM_CHAT_ID"]),
+            ))
+        except CheckoutError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+        return RedirectResponse(url=f"/order/{result.public_token}", status_code=303)
 
     @app.get("/order/{token}", response_class=HTMLResponse, name="order_success")
     def order_success(request: Request, token: str) -> HTMLResponse:
@@ -621,11 +532,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
 
     @app.get("/media/{filename:path}", name="media")
     def media(filename: str) -> FileResponse:
+        if (len(filename) > 1024 or any(ord(char) < 32 for char in filename)
+                or any(part.startswith(".") for part in filename.replace("\\", "/").split("/"))
+                or Path(filename).suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}):
+            raise HTTPException(status_code=404)
         root_path = Path(settings["UPLOAD_ROOT"]).resolve()
-        file_path = (root_path / filename).resolve()
+        try:
+            file_path = (root_path / filename).resolve()
+            exists = file_path.is_file()
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=404) from exc
         if root_path != file_path and root_path not in file_path.parents:
             raise HTTPException(status_code=404)
-        if not file_path.is_file():
+        if not exists:
             raise HTTPException(status_code=404)
         return FileResponse(file_path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
@@ -643,23 +562,43 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
     async def admin_login_post(request: Request) -> RedirectResponse:
         form = await _verified_form(request)
         password = str(form.get("password", ""))
-        expected = str(settings["ADMIN_PASSWORD"])
-        if expected and hmac.compare_digest(password, expected):
-            request.session.clear()
-            request.session["admin_authenticated"] = True
-            _ensure_csrf(request)
-            return RedirectResponse(url=_safe_next_url(str(form.get("next", "/admin"))), status_code=303)
+        valid = await anyio.to_thread.run_sync(
+            verify_password, str(settings["ADMIN_PASSWORD_HASH"]), password, limiter=app.state.login_limiter
+        )
+        if valid:
+            old_cookie = request.cookies.get(ADMIN_COOKIE, "")
+            await anyio.to_thread.run_sync(revoke_sessions, settings, old_cookie)
+            token = await anyio.to_thread.run_sync(create_admin_session, settings)
+            # Preserve guest checkout scope, rotate its CSRF on privilege change.
+            request.session.pop("admin_authenticated", None)
+            request.session["csrf_token"] = secrets.token_urlsafe(32)
+            response = RedirectResponse(url=_safe_next_url(str(form.get("next", "/admin"))), status_code=303)
+            response.set_cookie(ADMIN_COOKIE, token, max_age=settings["ADMIN_ABSOLUTE_SECONDS"],
+                                httponly=True, secure=settings["SESSION_COOKIE_SECURE"], samesite="strict", path="/")
+            return response
         next_url = _safe_next_url(str(form.get("next", "/admin")))
         _flash(request, "Неверный пароль", "error")
         return RedirectResponse(url=f"/admin/login?next={quote(next_url)}", status_code=303)
 
     @app.post("/admin/logout", name="admin_logout")
     async def admin_logout(request: Request) -> RedirectResponse:
-        if not _admin_authenticated(request):
-            return _admin_redirect(request)
         await _verified_form(request)
-        request.session.clear()
-        return RedirectResponse(url="/", status_code=303)
+        await anyio.to_thread.run_sync(revoke_sessions, settings, request.cookies.get(ADMIN_COOKIE, ""))
+        request.session["csrf_token"] = secrets.token_urlsafe(32)
+        response = RedirectResponse(url="/", status_code=303)
+        response.delete_cookie(ADMIN_COOKIE, path="/", secure=settings["SESSION_COOKIE_SECURE"],
+                               httponly=True, samesite="strict")
+        return response
+
+    @app.post("/admin/sessions/revoke", name="admin_revoke_sessions")
+    async def admin_revoke_sessions(request: Request) -> RedirectResponse:
+        await _verified_form(request)
+        await anyio.to_thread.run_sync(revoke_sessions, settings)
+        request.session["csrf_token"] = secrets.token_urlsafe(32)
+        response = RedirectResponse(url="/admin/login", status_code=303)
+        response.delete_cookie(ADMIN_COOKIE, path="/", secure=settings["SESSION_COOKIE_SECURE"],
+                               httponly=True, samesite="strict")
+        return response
 
     @app.get("/admin", response_class=HTMLResponse, name="admin_dashboard")
     def admin_dashboard(request: Request) -> Response:
@@ -688,71 +627,39 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
     async def admin_import(request: Request) -> RedirectResponse:
         if not _admin_authenticated(request):
             return _admin_redirect(request)
-        form = await _verified_form(request, max_files=10, max_fields=50, max_part_size=MAX_UPLOAD_BYTES)
-        raw_files = form.getlist("files")
-        files = [file for file in raw_files if isinstance(file, StarletteUploadFile) and file.filename]
-        deactivate_missing = str(form.get("deactivate_missing", "")) == "1"
-        multiplier_raw = str(form.get("price_multiplier", settings["PRICE_MULTIPLIER"])).strip()
+        form = await _verified_form(request, max_files=10, max_fields=10)
         try:
-            multiplier = Decimal(multiplier_raw)
-            if multiplier <= 0 or multiplier > Decimal("100"):
-                raise InvalidOperation
-        except InvalidOperation:
-            _flash(request, "Некорректный коэффициент цены", "error")
-            return RedirectResponse(url="/admin", status_code=303)
-        if not files:
-            _flash(request, "Выберите хотя бы один XLSX-файл", "error")
-            return RedirectResponse(url="/admin", status_code=303)
-        if len(files) > 10:
-            _flash(request, "За один раз можно загрузить не больше 10 файлов", "error")
-            return RedirectResponse(url="/admin", status_code=303)
-        if deactivate_missing and len(files) > 1:
-            _flash(
-                request,
-                "Скрытие отсутствующих безопасно выполнять только с одним полным прайсом. "
-                "Загрузите файлы без этой галочки или импортируйте полный файл отдельно.",
-                "error",
-            )
-            return RedirectResponse(url="/admin", status_code=303)
-
-        settings["PRICE_MULTIPLIER"] = str(multiplier)
-        completed: list[ImportResult] = []
-        failed: list[str] = []
-        with closing(connect(settings["DATABASE_PATH"])) as db:
-            for uploaded in files:
-                original_name = Path(uploaded.filename or "price.xlsx").name
-                if not original_name.lower().endswith(".xlsx"):
-                    failed.append(f"{original_name}: нужен файл .xlsx")
-                    continue
-                safe_name = _safe_filename(original_name)
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-                archive_name = f"{stamp}-{secrets.token_hex(4)}-{safe_name}"
-                archive_path = Path(settings["IMPORT_ARCHIVE"]) / archive_name
-                total_written = 0
-                try:
-                    with archive_path.open("wb") as destination:
-                        while True:
-                            chunk = await uploaded.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            total_written += len(chunk)
-                            if total_written > MAX_UPLOAD_BYTES:
-                                raise ValueError("файл превышает лимит 100 МБ")
-                            destination.write(chunk)
-                    result = import_xlsx(
-                        db,
-                        archive_path,
-                        settings["UPLOAD_ROOT"],
-                        original_filename=original_name,
-                        price_multiplier=multiplier,
-                        deactivate_missing=deactivate_missing,
-                    )
-                    completed.append(result)
-                except Exception as exc:
-                    LOGGER.exception("Import failed for %s", original_name)
-                    failed.append(f"{original_name}: {exc}")
-                finally:
-                    await uploaded.close()
+            files = [file for file in form.getlist("files")
+                     if isinstance(file, StarletteUploadFile) and file.filename]
+            deactivate_missing = str(form.get("deactivate_missing", "")) == "1"
+            multiplier_raw = str(form.get("price_multiplier", settings["PRICE_MULTIPLIER"])).strip()
+            try:
+                if len(multiplier_raw) > 32:
+                    raise InvalidOperation
+                multiplier = Decimal(multiplier_raw)
+                if not multiplier.is_finite() or multiplier <= 0 or multiplier > Decimal("100"):
+                    raise InvalidOperation
+            except InvalidOperation as exc:
+                raise HTTPException(400, "Некорректный коэффициент цены") from exc
+            if not files or len(files) > 10 or (deactivate_missing and len(files) != 1):
+                raise HTTPException(400, "Выберите до 10 XLSX; скрытие отсутствующих требует одного файла")
+            try:
+                completed, failed = await anyio.to_thread.run_sync(partial(
+                    run_imports, settings["DATABASE_PATH"], settings["UPLOAD_ROOT"], settings["IMPORT_ARCHIVE"],
+                    [(file.filename or "price.xlsx", file.file) for file in files],
+                    price_multiplier=multiplier, deactivate_missing=deactivate_missing,
+                ), limiter=app.state.import_limiter)
+            except ImportLimitError as exc:
+                raise HTTPException(413, "Превышен бюджет импорта") from exc
+            except ImportBusyError as exc:
+                raise HTTPException(429, "Импорт уже выполняется", headers={"Retry-After": "10"}) from exc
+            except ValueError as exc:
+                raise HTTPException(400, "Некорректный XLSX-файл") from exc
+        finally:
+            with anyio.CancelScope(shield=True):
+                await form.close()
+        if completed:
+            settings["PRICE_MULTIPLIER"] = str(multiplier)
 
         for result in completed:
             _flash(
@@ -783,13 +690,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             where.append("(order_number LIKE ? OR customer_name LIKE ? COLLATE NOCASE OR phone LIKE ?)")
             params.extend([needle, needle, needle])
         with closing(connect(settings["DATABASE_PATH"])) as db:
+            # The clauses are constant strings; search/status values remain bound parameters.
             orders = db.execute(
-                f"SELECT * FROM orders WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 300", params
+                f"SELECT * FROM orders WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 300", params  # nosec B608
             ).fetchall()
         return render(request, "admin/orders.html", orders=orders, selected_status=status, query=query)
 
     @app.get("/admin/orders/{order_id}", response_class=HTMLResponse, name="admin_order_detail")
-    def admin_order_detail(request: Request, order_id: int) -> Response:
+    def admin_order_detail(request: Request, order_id: DatabaseId) -> Response:
         if not _admin_authenticated(request):
             return _admin_redirect(request)
         with closing(connect(settings["DATABASE_PATH"])) as db:
@@ -800,7 +708,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         return render(request, "admin/order_detail.html", order=order, items=items)
 
     @app.post("/admin/orders/{order_id}", name="admin_order_update")
-    async def admin_order_update(request: Request, order_id: int) -> RedirectResponse:
+    async def admin_order_update(request: Request, order_id: DatabaseId) -> RedirectResponse:
         if not _admin_authenticated(request):
             return _admin_redirect(request)
         form = await _verified_form(request)
@@ -808,14 +716,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         if status not in ORDER_STATUSES:
             _flash(request, "Неизвестный статус", "error")
             return RedirectResponse(url=f"/admin/orders/{order_id}", status_code=303)
-        with closing(connect(settings["DATABASE_PATH"])) as db:
-            cursor = db.execute(
-                "UPDATE orders SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-                (status, order_id),
-            )
-            if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Заказ не найден")
-            db.commit()
+        def update_order() -> None:
+            with closing(connect(settings["DATABASE_PATH"])) as db, db:
+                cursor = db.execute(
+                    "UPDATE orders SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                    (status, order_id),
+                )
+                if cursor.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Заказ не найден")
+        await anyio.to_thread.run_sync(update_order)
         _flash(request, "Статус заказа обновлён", "success")
         return RedirectResponse(url=f"/admin/orders/{order_id}", status_code=303)
 
@@ -838,18 +747,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         elif active_filter == "0":
             where.append("active = 0")
         where_sql = " AND ".join(where)
+        # Only constant clauses are composed; all search values use bound parameters.
         with closing(connect(settings["DATABASE_PATH"])) as db:
-            total = int(db.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params).fetchone()[0])
+            total = int(db.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params).fetchone()[0])  # nosec B608
             pages = max(1, math.ceil(total / per_page))
             page = min(page, pages)
             rows = db.execute(
-                f"SELECT * FROM products WHERE {where_sql} ORDER BY brand, category, model LIMIT ? OFFSET ?",
+                f"SELECT * FROM products WHERE {where_sql} ORDER BY brand, category, model LIMIT ? OFFSET ?",  # nosec B608
                 [*params, per_page, (page - 1) * per_page],
             ).fetchall()
         return render(
             request,
             "admin/products.html",
-            products=[_product_dict(row) for row in rows],
+            products=[_admin_product_dict(row) for row in rows],
             query=query,
             active_filter=active_filter,
             page=page,
@@ -858,7 +768,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         )
 
     @app.post("/admin/products/{product_id}", name="admin_product_update")
-    async def admin_product_update(request: Request, product_id: int) -> RedirectResponse:
+    async def admin_product_update(request: Request, product_id: DatabaseId) -> RedirectResponse:
         if not _admin_authenticated(request):
             return _admin_redirect(request)
         form = await _verified_form(request)
@@ -868,20 +778,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             _flash(request, str(exc), "error")
             return RedirectResponse(url="/admin/products", status_code=303)
         active = 1 if str(form.get("active", "")) == "1" else 0
-        with closing(connect(settings["DATABASE_PATH"])) as db:
-            row = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Товар не найден")
-            db.execute(
-                """
-                UPDATE products
-                SET price_cents = ?, active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?
-                """,
-                (price_cents, active, product_id),
-            )
-            db.commit()
-        _flash(request, f"{_product_title(row)}: сохранено", "success")
+        def update_product() -> str:
+            with closing(connect(settings["DATABASE_PATH"])) as db, db:
+                row = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Товар не найден")
+                db.execute(
+                    "UPDATE products SET price_cents=?, active=?, "
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    (price_cents, active, product_id),
+                )
+                return _product_title(row)
+        title = await anyio.to_thread.run_sync(update_product)
+        _flash(request, f"{title}: сохранено", "success")
         return RedirectResponse(url="/admin/products", status_code=303)
 
     @app.get("/admin/export/orders.csv", name="admin_orders_csv")
@@ -936,11 +845,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             headers={"Content-Disposition": "attachment; filename=orders.csv"},
         )
 
-    @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException) -> Response:
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> Response:
         if request.url.path.startswith("/api/"):
-            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
         message = str(exc.detail) if exc.detail else ("Страница не найдена" if exc.status_code == 404 else "Некорректный запрос")
-        return render(request, "error.html", status_code=exc.status_code, code=exc.status_code, message=message)
+        response = render(request, "error.html", status_code=exc.status_code, code=exc.status_code, message=message)
+        response.headers.update(exc.headers or {})
+        return response
 
     return app

@@ -30,7 +30,8 @@ def send_order_notification(token: str, chat_id: str, order: dict[str, Any], ite
     ])
     payload = urllib.parse.urlencode({
         "chat_id": chat_id,
-        "text": "\n".join(lines),
+        # Telegram limits messages to 4096 characters; account for UTF-16 units.
+        "text": "\n".join(lines).encode("utf-16-le")[:8000].decode("utf-16-le", errors="ignore"),
         "disable_web_page_preview": "true",
     }).encode("utf-8")
     request = urllib.request.Request(
@@ -38,7 +39,13 @@ def send_order_notification(token: str, chat_id: str, order: dict[str, Any], ite
         data=payload,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=5) as response:
+    # Request URL uses a fixed HTTPS Telegram origin, not user-supplied URLs.
+    with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310
         if response.status >= 400:
             raise RuntimeError(f"Telegram API returned HTTP {response.status}")
-        json.loads(response.read().decode("utf-8"))
+        body = response.read(64 * 1024 + 1)
+        if len(body) > 64 * 1024:
+            raise RuntimeError("Telegram API response exceeds limit")
+        result = json.loads(body.decode("utf-8"))
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise RuntimeError("Telegram API rejected notification")

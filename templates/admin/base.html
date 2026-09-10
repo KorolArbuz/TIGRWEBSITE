@@ -25,6 +25,10 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="button button-ghost button-small" type="submit">Выйти</button>
       </form>
+      <form method="post" action="{{ url_for('admin_revoke_sessions') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="button button-ghost button-small" type="submit">Завершить все сеансы</button>
+      </form>
     </div>
   </header>
   {% if flashes %}<div class="container flash-stack admin-flashes">{% for category, message in flashes %}<div class="flash flash-{{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}

@@ -9,11 +9,6 @@ echo HOCO Catalog - local start, NO DOCKER
 echo ==========================================
 echo.
 
-if not exist ".env" (
-    copy /Y ".env.example" ".env" >nul
-    echo Created .env from .env.example
-)
-
 set "PY_CMD="
 where py >nul 2>&1
 if not errorlevel 1 set "PY_CMD=py -3"
@@ -32,8 +27,16 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo Installing/updating Python dependencies ...
-".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r "requirements.txt"
+".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --require-hashes -r "requirements.txt"
 if errorlevel 1 goto failed
+
+if not exist ".env" (
+    ".venv\Scripts\python.exe" "scripts\setup_security.py" --development
+    if errorlevel 1 goto failed
+)
+set "APP_ENV=development"
+set "SESSION_COOKIE_SECURE=false"
+set "ALLOWED_HOSTS=localhost,127.0.0.1"
 
 echo.
 echo ==========================================

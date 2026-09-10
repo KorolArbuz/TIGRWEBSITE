@@ -1,15 +1,118 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import posixpath
 import re
+import struct
+import tempfile
+import time
+import warnings as image_warnings
 import zipfile
+import zlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-import xml.etree.ElementTree as ET
+# Element annotations and ParseError only; all XML is parsed by SafeET below.
+import xml.etree.ElementTree as ET  # nosec B405
+
+from defusedxml import ElementTree as SafeET
+from defusedxml.common import DefusedXmlException
+from PIL import Image, UnidentifiedImageError
+
+MAX_FILE_BYTES = 100 * 1024 * 1024
+MAX_ENTRY_BYTES = 32 * 1024 * 1024
+MAX_XML_BYTES = 16 * 1024 * 1024
+MAX_TOTAL_XML_BYTES = 64 * 1024 * 1024
+MAX_XML_NODES = 750_000
+MAX_ROWS = 50_000
+MAX_CELLS = 500_000
+MAX_CELL_TEXT = 32_768
+MAX_IMAGES = 2_000
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_IMAGE_BYTES = 150 * 1024 * 1024
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_IMAGE_FRAMES = 50
+MAX_IMAGE_FRAME_PIXELS = 32_000_000
+MAX_TOTAL_IMAGE_PIXELS = 500_000_000
+MAX_IMPORT_SECONDS = 60
+MAX_PRICE_CENTS = 100_000_000_00
+
+
+class ImportLimitError(ValueError):
+    """An import exceeded its documented resource budget."""
+
+
+def _check_deadline(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise ImportLimitError("Превышен лимит времени обработки XLSX")
+
+
+class WorkbookReader:
+    """Bound actual decompression and XML work before building large trees."""
+
+    def __init__(self, archive: zipfile.ZipFile):
+        self.archive = archive
+        self.names = frozenset(archive.namelist())
+        self.deadline = time.monotonic() + MAX_IMPORT_SECONDS
+        self.xml_bytes = self.nodes = self.rows = self.cells = 0
+        self.image_bytes = self.image_pixels = 0
+        self._xml_cache: OrderedDict[str, ET.Element] = OrderedDict()
+
+    def check_time(self) -> None:
+        _check_deadline(self.deadline)
+
+    def namelist(self) -> frozenset[str]:
+        return self.names
+
+    def read(self, path: str, maximum: int = MAX_ENTRY_BYTES) -> bytes:
+        self.check_time()
+        if path not in self.names:
+            raise ValueError("В XLSX отсутствует связанная часть")
+        if self.archive.getinfo(path).file_size > maximum:
+            raise ImportLimitError("Внутренний файл XLSX превышает безопасный лимит")
+        with self.archive.open(path) as stream:
+            blob = stream.read(maximum + 1)
+        if len(blob) > maximum:
+            raise ImportLimitError("Внутренний файл XLSX превышает безопасный лимит")
+        return blob
+
+    def xml(self, path: str) -> ET.Element:
+        self.check_time()
+        if path in self._xml_cache:
+            self._xml_cache.move_to_end(path)
+            return self._xml_cache[path]
+        blob = self.read(path, MAX_XML_BYTES)
+        self.xml_bytes += len(blob)
+        if self.xml_bytes > MAX_TOTAL_XML_BYTES:
+            raise ImportLimitError("Превышен суммарный лимит XML в XLSX")
+        depth = 0
+        try:
+            parser = SafeET.iterparse(io.BytesIO(blob), events=("start", "end"), forbid_dtd=True)
+            for event, node in parser:
+                if event == "start":
+                    depth += 1
+                    self.nodes += 1
+                    if depth > 64 or self.nodes > MAX_XML_NODES:
+                        raise ImportLimitError("Превышен лимит сложности XML")
+                    if self.nodes % 1024 == 0:
+                        self.check_time()
+                else:
+                    depth -= 1
+                    if len(node.text or "") > MAX_CELL_TEXT:
+                        raise ImportLimitError("Текстовая ячейка XLSX слишком длинная")
+                    if any(len(value) > MAX_CELL_TEXT for value in node.attrib.values()):
+                        raise ImportLimitError("Атрибут XML слишком длинный")
+            root = parser.root
+        except (ET.ParseError, DefusedXmlException, LookupError) as exc:
+            raise ValueError("Некорректный или неподдерживаемый XML в XLSX") from exc
+        self._xml_cache[path] = root
+        while len(self._xml_cache) > 2:
+            self._xml_cache.popitem(last=False)
+        return root
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL_DOC = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -28,19 +131,30 @@ def rels_path(part_path: str) -> str:
 
 
 def resolve_target(part_path: str, target: str) -> str:
-    return posixpath.normpath(posixpath.join(posixpath.dirname(part_path), target))
+    if not target or any(char in target for char in ("\\", ":", "?", "#", "%", "\x00")):
+        raise ValueError("Неподдерживаемая связь XLSX")
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(part_path), target))
+    if resolved.startswith("/"):
+        resolved = resolved[1:]
+    if resolved == ".." or resolved.startswith("../"):
+        raise ValueError("Связь XLSX выходит за пределы книги")
+    return resolved
 
 
-def parse_relationships(zf: zipfile.ZipFile, part_path: str) -> dict[str, str]:
+def parse_relationships(zf: WorkbookReader, part_path: str) -> dict[str, str]:
     rp = rels_path(part_path)
     if rp not in zf.namelist():
         return {}
-    root = ET.fromstring(zf.read(rp))
+    root = zf.xml(rp)
     out: dict[str, str] = {}
     for rel in root.findall(q(NS_REL_PKG, "Relationship")):
         rid = rel.attrib.get("Id")
         target = rel.attrib.get("Target")
+        if rel.attrib.get("TargetMode", "Internal") != "Internal":
+            raise ValueError("Внешние связи XLSX запрещены")
         if rid and target:
+            if rid in out:
+                raise ValueError("Повторяющаяся связь XLSX")
             out[rid] = resolve_target(part_path, target)
     return out
 
@@ -48,24 +162,32 @@ def parse_relationships(zf: zipfile.ZipFile, part_path: str) -> dict[str, str]:
 def get_text(node: ET.Element | None) -> str:
     if node is None:
         return ""
-    return "".join((t.text or "") for t in node.iter(q(NS_MAIN, "t")))
+    text = "".join((t.text or "") for t in node.iter(q(NS_MAIN, "t")))
+    if len(text) > MAX_CELL_TEXT:
+        raise ImportLimitError("Текстовая ячейка XLSX слишком длинная")
+    return text
 
 
-def read_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+def read_shared_strings(zf: WorkbookReader) -> list[str]:
     path = "xl/sharedStrings.xml"
     if path not in zf.namelist():
         return []
-    root = ET.fromstring(zf.read(path))
-    return [get_text(si) for si in root.findall(q(NS_MAIN, "si"))]
+    root = zf.xml(path)
+    strings = root.findall(q(NS_MAIN, "si"))
+    if len(strings) > 100_000:
+        raise ImportLimitError("Слишком много общих строк XLSX")
+    return [get_text(si) for si in strings]
 
 
 def col_index(cell_ref: str) -> int:
-    letters = re.match(r"[A-Z]+", cell_ref.upper())
+    letters = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]{0,6})", cell_ref.upper())
     if not letters:
-        return 0
+        raise ValueError("Некорректный адрес ячейки XLSX")
     value = 0
-    for ch in letters.group(0):
+    for ch in letters.group(1):
         value = value * 26 + (ord(ch) - 64)
+    if value > 16_384 or int(letters.group(2)) > 1_048_576:
+        raise ValueError("Адрес ячейки вне допустимых пределов XLSX")
     return value - 1
 
 
@@ -79,35 +201,50 @@ def read_cell_value(cell: ET.Element, shared: list[str]) -> Any:
         return None
     if cell_type == "s":
         try:
-            return shared[int(raw)]
+            index = int(raw)
+            if index < 0:
+                raise ValueError
+            return shared[index]
         except (ValueError, IndexError):
-            return raw
+            raise ValueError("Некорректный индекс общей строки XLSX") from None
     if cell_type == "b":
         return raw == "1"
     return raw
 
 
-def read_sheet_rows(zf: zipfile.ZipFile, sheet_path: str, shared: list[str]) -> dict[int, dict[int, Any]]:
-    root = ET.fromstring(zf.read(sheet_path))
+def read_sheet_rows(zf: WorkbookReader, sheet_path: str, shared: list[str]) -> dict[int, dict[int, Any]]:
+    root = zf.xml(sheet_path)
     sheet_data = root.find(q(NS_MAIN, "sheetData"))
     rows: dict[int, dict[int, Any]] = {}
     if sheet_data is None:
         return rows
     for row in sheet_data.findall(q(NS_MAIN, "row")):
+        zf.check_time()
+        zf.rows += 1
+        if zf.rows > MAX_ROWS:
+            raise ImportLimitError("В XLSX слишком много строк")
         try:
             row_num = int(row.attrib.get("r", "0"))
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError("Некорректный номер строки XLSX") from exc
+        if not 1 <= row_num <= 1_048_576 or row_num in rows:
+            raise ValueError("Некорректный или повторяющийся номер строки XLSX")
         values: dict[int, Any] = {}
         for cell in row.findall(q(NS_MAIN, "c")):
+            zf.cells += 1
+            if zf.cells > MAX_CELLS:
+                raise ImportLimitError("В XLSX слишком много ячеек")
             ref = cell.attrib.get("r", "A1")
-            values[col_index(ref)] = read_cell_value(cell, shared)
+            column = col_index(ref)
+            if column in values:
+                raise ValueError("Повторяющаяся ячейка XLSX")
+            values[column] = read_cell_value(cell, shared)
         rows[row_num] = values
     return rows
 
 
-def drawing_for_sheet(zf: zipfile.ZipFile, sheet_path: str) -> str | None:
-    root = ET.fromstring(zf.read(sheet_path))
+def drawing_for_sheet(zf: WorkbookReader, sheet_path: str) -> str | None:
+    root = zf.xml(sheet_path)
     drawing = root.find(q(NS_MAIN, "drawing"))
     if drawing is None:
         return None
@@ -117,12 +254,12 @@ def drawing_for_sheet(zf: zipfile.ZipFile, sheet_path: str) -> str | None:
     return parse_relationships(zf, sheet_path).get(rid)
 
 
-def read_image_anchors(zf: zipfile.ZipFile, sheet_path: str) -> dict[int, list[tuple[int, int, str]]]:
+def read_image_anchors(zf: WorkbookReader, sheet_path: str) -> dict[int, list[tuple[int, int, str]]]:
     drawing_path = drawing_for_sheet(zf, sheet_path)
     if not drawing_path or drawing_path not in zf.namelist():
         return {}
     rels = parse_relationships(zf, drawing_path)
-    root = ET.fromstring(zf.read(drawing_path))
+    root = zf.xml(drawing_path)
     by_row: dict[int, list[tuple[int, int, str]]] = {}
     for anchor_tag in ("oneCellAnchor", "twoCellAnchor"):
         for anchor in root.findall(q(NS_XDR, anchor_tag)):
@@ -197,7 +334,7 @@ def detect_header(rows: dict[int, dict[int, Any]]) -> tuple[int, dict[str, int]]
         score = sum(field in mapping for field in ("model", "barcode", "price", "color", "description"))
         if best is None or score > best[0]:
             best = (score, row_num, mapping)
-    if not best or best[0] < 3:
+    if not best or not all(field in best[2] for field in ("model", "barcode", "price")):
         raise ValueError("Не удалось определить строку заголовков: нужны как минимум модель, штрихкод и цена")
     mapping = dict(best[2])
     # В прайсах HOCO/Borofone первая колонка — категория, но заголовок пустой.
@@ -223,17 +360,21 @@ def normalize_title_text(value: Any) -> str:
 
 def normalize_barcode(value: Any) -> str:
     text = normalize_title_text(value)
-    if not text:
+    if not text or len(text) > 128 or isinstance(value, bool):
         return ""
     # Preserve leading zeroes for text barcodes. Convert only decimal/scientific
     # numeric representations produced by spreadsheet software.
-    if not re.fullmatch(r"\d+", text):
+    if not re.fullmatch(r"[0-9]+", text):
+        if not re.fullmatch(r"[0-9]+(?:[.,][0-9]+)?(?:[eE][+-]?[0-9]{1,3})?", text):
+            return ""
         try:
             decimal = Decimal(text.replace(",", "."))
-            if decimal == decimal.to_integral_value():
+            if decimal.is_finite() and 0 <= decimal < Decimal("1e18") and decimal == decimal.to_integral_value():
                 text = format(decimal.quantize(Decimal("1")), "f")
+            else:
+                return ""
         except InvalidOperation:
-            pass
+            return ""
     digits = re.sub(r"\D", "", text)
     return digits if 6 <= len(digits) <= 18 else ""
 
@@ -241,18 +382,19 @@ def normalize_barcode(value: Any) -> str:
 def parse_price_cents(value: Any) -> int | None:
     text = normalize_title_text(value).replace(" ", "").replace("₽", "").replace("руб.", "").replace("руб", "")
     text = text.replace(",", ".")
-    if not text:
+    if not text or len(text) > 64 or isinstance(value, bool):
         return None
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    match = re.fullmatch(r"[+]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]{1,3})?", text)
     if not match:
         return None
     try:
         amount = Decimal(match.group(0))
-    except InvalidOperation:
+        if not amount.is_finite() or amount <= 0 or amount > Decimal(MAX_PRICE_CENTS) / 100:
+            return None
+        cents = int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, OverflowError):
         return None
-    if amount <= 0:
-        return None
-    return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return cents if 0 < cents <= MAX_PRICE_CENTS else None
 
 
 @dataclass
@@ -272,18 +414,34 @@ class ParsedProduct:
 
 
 def parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, bytes], list[str]]:
+    try:
+        return _parse_workbook(path)
+    except (zipfile.BadZipFile, zlib.error, NotImplementedError, EOFError) as exc:
+        raise ValueError("Файл повреждён или не является XLSX") from exc
+
+
+def _parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, bytes], list[str]]:
+    _verify_archive(path)
     products: list[ParsedProduct] = []
     media: dict[str, bytes] = {}
+    media_hashes: dict[str, str] = {}
     warnings: list[str] = []
-    with zipfile.ZipFile(path) as zf:
+    with zipfile.ZipFile(path) as archive:
+        zf = WorkbookReader(archive)
+        _verify_package(zf)
         shared = read_shared_strings(zf)
         workbook_path = "xl/workbook.xml"
-        root = ET.fromstring(zf.read(workbook_path))
+        root = zf.xml(workbook_path)
         workbook_rels = parse_relationships(zf, workbook_path)
         sheets_node = root.find(q(NS_MAIN, "sheets"))
         if sheets_node is None:
             return products, media, ["В книге нет листов"]
-        for sheet in sheets_node.findall(q(NS_MAIN, "sheet")):
+        sheets = sheets_node.findall(q(NS_MAIN, "sheet"))
+        if len(sheets) > 100:
+            raise ImportLimitError("В XLSX слишком много листов")
+        seen_barcodes: set[str] = set()
+        for sheet in sheets:
+            zf.check_time()
             sheet_name = sheet.attrib.get("name", "Лист")
             rid = sheet.attrib.get(q(NS_REL_DOC, "id"))
             sheet_path = workbook_rels.get(rid or "")
@@ -299,6 +457,7 @@ def parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, byt
             images_by_row = read_image_anchors(zf, sheet_path)
             brand = normalize_title_text(sheet_name)
             for row_num in sorted(rows):
+                zf.check_time()
                 if row_num <= header_row:
                     continue
                 row = rows[row_num]
@@ -306,16 +465,32 @@ def parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, byt
                 barcode = normalize_barcode(row.get(columns["barcode"]))
                 price_cents = parse_price_cents(row.get(columns["price"]))
                 if not (model and barcode and price_cents):
-                    # Ignore truly empty rows; report only rows that look like products.
+                    # Empty formatting rows are allowed; malformed product rows
+                    # reject the whole file before any catalog mutation.
                     if model or barcode or price_cents:
-                        warnings.append(f"{sheet_name}, строка {row_num}: пропущена (нужны модель, штрихкод и цена)")
+                        raise ValueError(f"Строка {row_num}: некорректные обязательные поля товара")
                     continue
+                if barcode in seen_barcodes:
+                    raise ValueError("В XLSX повторяется штрихкод товара")
+                seen_barcodes.add(barcode)
                 item_media = [m for _col, _off, m in images_by_row.get(row_num, [])]
                 dedup_media: list[str] = []
                 seen_hashes: set[str] = set()
                 for media_path in item_media:
-                    blob = zf.read(media_path)
-                    digest = hashlib.sha256(blob).hexdigest()
+                    zf.check_time()
+                    if media_path not in media:
+                        if len(media) >= MAX_IMAGES:
+                            raise ImportLimitError("В XLSX слишком много изображений")
+                        blob = zf.read(media_path, MAX_IMAGE_BYTES)
+                        zf.image_bytes += len(blob)
+                        _extension, decoded_pixels = _validate_image(blob, deadline=zf.deadline)
+                        zf.image_pixels += decoded_pixels
+                        if zf.image_bytes > MAX_TOTAL_IMAGE_BYTES or zf.image_pixels > MAX_TOTAL_IMAGE_PIXELS:
+                            raise ImportLimitError("Превышен суммарный лимит изображений XLSX")
+                        media[media_path] = blob
+                        media_hashes[media_path] = hashlib.sha256(blob).hexdigest()
+                    blob = media[media_path]
+                    digest = media_hashes[media_path]
                     if digest in seen_hashes:
                         continue
                     seen_hashes.add(digest)
@@ -366,47 +541,161 @@ class ImportResult:
 
 def _verify_archive(path: str | Path, max_uncompressed_bytes: int = 300 * 1024 * 1024) -> None:
     try:
+        if Path(path).stat().st_size > MAX_FILE_BYTES:
+            raise ImportLimitError("XLSX превышает лимит размера файла")
         with zipfile.ZipFile(path) as zf:
             if len(zf.infolist()) > 10_000:
-                raise ValueError("В XLSX слишком много внутренних файлов")
+                raise ImportLimitError("В XLSX слишком много внутренних файлов")
             total_size = sum(info.file_size for info in zf.infolist())
             if total_size > max_uncompressed_bytes:
-                raise ValueError("Распакованный XLSX превышает безопасный лимит")
+                raise ImportLimitError("Распакованный XLSX превышает безопасный лимит")
+            xml_size = sum(info.file_size for info in zf.infolist() if info.filename.endswith((".xml", ".rels")))
+            if xml_size > MAX_TOTAL_XML_BYTES:
+                raise ImportLimitError("Превышен суммарный лимит XML в XLSX")
+            names: set[str] = set()
+            for info in zf.infolist():
+                name = info.filename
+                if name in names:
+                    raise ValueError("В XLSX повторяются имена внутренних файлов")
+                names.add(name)
+                if (not name or name.startswith("/") or any(char in name for char in ("\\", ":", "\x00"))
+                        or ".." in name.split("/") or len(name) > 255):
+                    raise ValueError("Некорректный путь внутри XLSX")
+                if info.flag_bits & 1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    raise ValueError("Неподдерживаемое шифрование или сжатие XLSX")
+                if info.file_size > MAX_ENTRY_BYTES:
+                    raise ImportLimitError("Внутренний файл XLSX превышает безопасный лимит")
+                if info.is_dir():
+                    continue
+                suffix = Path(name).suffix.lower()
+                if suffix not in {".xml", ".rels", ".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+                    raise ValueError("Неподдерживаемое содержимое XLSX")
+                if any(part.lower() in {"externallinks", "embeddings", "activex", "macros"} for part in name.split("/")):
+                    raise ValueError("Активное или внешнее содержимое XLSX запрещено")
+                if suffix in {".xml", ".rels"} and info.file_size > MAX_XML_BYTES:
+                    raise ImportLimitError("XML в XLSX превышает безопасный лимит")
             if "xl/workbook.xml" not in zf.namelist():
                 raise ValueError("Файл не похож на корректную книгу XLSX")
-    except zipfile.BadZipFile as exc:
+    except (zipfile.BadZipFile, NotImplementedError, EOFError) as exc:
         raise ValueError("Файл повреждён или не является XLSX") from exc
 
 
+def _verify_package(zf: WorkbookReader) -> None:
+    allowed_types = {
+        "application/xml", "application/vnd.openxmlformats-package.relationships+xml",
+        "application/vnd.openxmlformats-package.core-properties+xml",
+        "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+        "application/vnd.openxmlformats-officedocument.custom-properties+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml",
+        "application/vnd.openxmlformats-officedocument.drawing+xml",
+        "application/vnd.openxmlformats-officedocument.theme+xml",
+        "image/png", "image/jpeg", "image/gif", "image/webp",
+    }
+    if "[Content_Types].xml" not in zf.names:
+        raise ValueError("В XLSX отсутствует описание типов содержимого")
+    for item in zf.xml("[Content_Types].xml"):
+        if item.attrib.get("ContentType") not in allowed_types:
+            raise ValueError("Неподдерживаемый тип содержимого XLSX")
+    # Check every relationships part, including parts the catalog does not use.
+    for name in sorted(zf.names):
+        if not name.endswith(".rels"):
+            continue
+        root = zf.xml(name)
+        for rel in root:
+            if rel.attrib.get("TargetMode", "Internal") != "Internal":
+                raise ValueError("Внешние связи XLSX запрещены")
+            target = rel.attrib.get("Target", "")
+            directory, filename = posixpath.split(name)
+            part = posixpath.join(posixpath.dirname(directory), filename[:-5])
+            resolved = resolve_target(part, target)
+            if resolved not in zf.names:
+                raise ValueError("В XLSX отсутствует связанная часть")
+
+
+def _validate_image(blob: bytes, *, deadline: float | None = None) -> tuple[str, int]:
+    if len(blob) > MAX_IMAGE_BYTES:
+        raise ImportLimitError("Изображение превышает лимит размера")
+    formats = {"PNG": ".png", "JPEG": ".jpg", "GIF": ".gif", "WEBP": ".webp"}
+    try:
+        with image_warnings.catch_warnings():
+            image_warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(blob), formats=list(formats)) as img:
+                extension = formats.get(img.format or "")
+                if not extension:
+                    raise ValueError("Неподдерживаемый формат изображения")
+                width, height = img.size
+                if width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS:
+                    raise ImportLimitError("Изображение превышает лимит пикселей")
+                img.verify()
+            # Decode every allowed frame: header signatures alone do not validate images.
+            with Image.open(io.BytesIO(blob), formats=list(formats)) as img:
+                pixels = 0
+                for index in range(MAX_IMAGE_FRAMES + 1):
+                    if deadline is not None:
+                        _check_deadline(deadline)
+                    try:
+                        img.seek(index)
+                    except EOFError:
+                        break
+                    if index >= MAX_IMAGE_FRAMES:
+                        raise ImportLimitError("Изображение содержит слишком много кадров")
+                    width, height = img.size
+                    pixels += width * height
+                    if width * height > MAX_IMAGE_PIXELS or pixels > MAX_IMAGE_FRAME_PIXELS:
+                        raise ImportLimitError("Кадры изображения превышают лимит пикселей")
+                    img.load()
+                return extension, pixels
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+        raise ImportLimitError("Изображение превышает безопасный лимит пикселей") from exc
+    except (UnidentifiedImageError, OSError, SyntaxError, EOFError, struct.error) as exc:
+        raise ValueError("Некорректное изображение XLSX") from exc
+
+
 def _image_extension(media_path: str, blob: bytes) -> str:
-    suffix = Path(media_path).suffix.lower()
-    if blob.startswith(b"\x89PNG\r\n\x1a\n"):
-        return ".png"
-    if blob.startswith(b"\xff\xd8\xff"):
-        return ".jpg"
-    if blob.startswith((b"GIF87a", b"GIF89a")):
-        return ".gif"
-    if blob.startswith(b"RIFF") and blob[8:12] == b"WEBP":
-        return ".webp"
-    return suffix if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"} else ".bin"
+    return _validate_image(blob)[0]
 
 
-def _save_image(blob: bytes, media_path: str, upload_root: str | Path) -> str:
+def _save_image(
+    blob: bytes, media_path: str, upload_root: str | Path,
+    created: set[Path] | None = None,
+    *, deadline: float | None = None,
+) -> str:
     digest = hashlib.sha256(blob).hexdigest()
-    extension = _image_extension(media_path, blob)
+    extension = _validate_image(blob, deadline=deadline)[0]
     relative = Path("products") / digest[:2] / f"{digest}{extension}"
     absolute = Path(upload_root) / relative
+    if not absolute.resolve().is_relative_to(Path(upload_root).resolve()):
+        raise ValueError("Недопустимый путь изображения")
     if not absolute.exists():
         absolute.parent.mkdir(parents=True, exist_ok=True)
-        temporary = absolute.with_suffix(absolute.suffix + ".tmp")
-        temporary.write_bytes(blob)
-        temporary.replace(absolute)
+        with tempfile.NamedTemporaryFile(dir=absolute.parent, suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            try:
+                stream.write(blob)
+            except BaseException:
+                stream.close()
+                temporary.unlink(missing_ok=True)
+                raise
+        try:
+            temporary.replace(absolute)
+            if created is not None:
+                created.add(absolute)
+        finally:
+            temporary.unlink(missing_ok=True)
     return "/media/" + relative.as_posix()
 
 
 def _display_price(source_price_cents: int, multiplier: Decimal) -> int:
     result = (Decimal(source_price_cents) * multiplier).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return max(0, int(result))
+    if not result.is_finite() or result < 1 or result > MAX_PRICE_CENTS:
+        raise ValueError("Цена с наценкой выходит за допустимые пределы")
+    return int(result)
 
 
 def import_xlsx(
@@ -419,31 +708,37 @@ def import_xlsx(
     deactivate_missing: bool = False,
 ) -> ImportResult:
     """Parse one XLSX and atomically upsert products by barcode."""
-    _verify_archive(path)
+    deadline = time.monotonic() + MAX_IMPORT_SECONDS
     filename = original_filename or Path(path).name
     try:
         multiplier = Decimal(str(price_multiplier))
     except InvalidOperation as exc:
         raise ValueError("Некорректный коэффициент наценки") from exc
-    if multiplier <= 0 or multiplier > Decimal("100"):
+    if not multiplier.is_finite() or multiplier <= 0 or multiplier > Decimal("100"):
         raise ValueError("Коэффициент наценки должен быть больше 0 и не больше 100")
 
     products, media, warnings = parse_workbook(path)
+    _check_deadline(deadline)
     if not products:
         raise ValueError("В файле не найдено ни одного товара с моделью, штрихкодом и ценой")
 
-    file_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    with Path(path).open("rb") as stream:
+        file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     result = ImportResult(filename=filename, warnings=list(warnings))
-    image_urls: dict[str, str] = {
-        media_path: _save_image(blob, media_path, upload_root)
-        for media_path, blob in media.items()
-    }
-    result.image_count = len(image_urls)
-
+    created: set[Path] = set()
     brands_seen: dict[str, set[str]] = {}
+    # The savepoint allows cleanup against the pre-import catalog while retaining
+    # the SQLite writer lock, so another import cannot adopt a file being removed.
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("SAVEPOINT catalog_import")
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        image_urls: dict[str, str] = {
+            media_path: _save_image(blob, media_path, upload_root, created, deadline=deadline)
+            for media_path, blob in media.items()
+        }
+        result.image_count = len(image_urls)
         for product in products:
+            _check_deadline(deadline)
             brands_seen.setdefault(product.brand, set()).add(product.barcode)
             images = [image_urls[path] for path in product.media_paths if path in image_urls]
             images_json = json.dumps(images, ensure_ascii=False, separators=(",", ":"))
@@ -556,7 +851,20 @@ def import_xlsx(
             ),
         )
         connection.commit()
-    except Exception:
-        connection.rollback()
+    except BaseException:
+        try:
+            connection.execute("ROLLBACK TO SAVEPOINT catalog_import")
+            root = Path(upload_root).resolve()
+            for image_path in created:
+                if not image_path.resolve().is_relative_to(root):
+                    continue
+                url = "/media/" + image_path.resolve().relative_to(root).as_posix()
+                in_use = connection.execute(
+                    "SELECT 1 FROM products WHERE instr(images_json, ?) > 0 LIMIT 1", (url,),
+                ).fetchone()
+                if not in_use:
+                    image_path.unlink(missing_ok=True)
+        finally:
+            connection.rollback()
         raise
     return result

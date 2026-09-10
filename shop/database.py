@@ -69,6 +69,52 @@ CREATE TABLE IF NOT EXISTS order_items (
 
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
 
+-- Additive security state: existing orders and public links remain unchanged.
+CREATE TABLE IF NOT EXISTS checkout_requests (
+    scope_hash TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (scope_hash, key_hash)
+);
+
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'sent', 'failed', 'disabled')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at REAL NOT NULL,
+    lease_until REAL,
+    lease_token TEXT,
+    created_at REAL NOT NULL,
+    sent_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_ready ON notification_outbox(status, available_at);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    credential_version TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry ON admin_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS security_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket TEXT PRIMARY KEY,
+    window_start REAL NOT NULL,
+    count INTEGER NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_expiry ON rate_limits(expires_at);
+
 CREATE TABLE IF NOT EXISTS import_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     filename TEXT NOT NULL,
@@ -107,6 +153,8 @@ def init_db(path: str | Path) -> None:
     try:
         connection.executescript(SCHEMA)
         # Lightweight forward-only migrations for databases created by earlier builds.
+        # Serialize inspection and ALTER together when multiple workers start.
+        connection.execute("BEGIN IMMEDIATE")
         order_columns = {row[1] for row in connection.execute("PRAGMA table_info(orders)").fetchall()}
         migrations = {
             "personal_data_consent": "ALTER TABLE orders ADD COLUMN personal_data_consent INTEGER NOT NULL DEFAULT 0",

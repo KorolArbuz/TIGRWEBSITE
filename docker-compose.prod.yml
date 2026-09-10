@@ -2,19 +2,44 @@ services:
   shop:
     build: .
     env_file:
-      - .env
+      - path: .env
+        format: raw
+    environment:
+      APP_ENV: production
+      SESSION_COOKIE_SECURE: "true"
+      ALLOWED_HOSTS: ${DOMAIN:?Set DOMAIN to the real shop hostname},127.0.0.1,localhost
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips=172.30.93.2", "--no-access-log", "--limit-concurrency", "64", "--backlog", "64", "--timeout-keep-alive", "5"]
     volumes:
       - ./data:/app/data
     restart: unless-stopped
     expose:
       - "8000"
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 128
+    mem_limit: 1536m
+    cpus: 2.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777
+    networks:
+      proxy:
+        ipv4_address: 172.30.93.3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.4-alpine
     depends_on:
-      - shop
+      shop:
+        condition: service_healthy
     environment:
-      DOMAIN: ${DOMAIN}
+      DOMAIN: ${DOMAIN:?Set DOMAIN to the real shop hostname}
     ports:
       - "80:80"
       - "443:443"
@@ -23,7 +48,32 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16777216,mode=1777
+    networks:
+      proxy:
+        ipv4_address: 172.30.93.2
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  proxy:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.93.0/29

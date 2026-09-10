@@ -7,6 +7,7 @@
     <div class="checkout-heading"><span class="eyebrow">Последний шаг</span><h1>Оформление заказа</h1><p>Цена и доступность будут повторно проверены при отправке формы.</p></div>
     <form class="checkout-grid js-checkout-form" method="post" action="{{ url_for('create_order') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
       <input class="js-cart-json" type="hidden" name="cart_json" value="[]">
       <div class="checkout-form-card">
         <div class="form-section">

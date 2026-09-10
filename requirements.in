@@ -1,0 +1,9 @@
+# Direct runtime dependencies. Regenerate the universal, hash-checked lock with uv.
+fastapi>=0.128,<1
+uvicorn>=0.48,<1
+python-multipart>=0.0.29,<1
+itsdangerous>=2.2,<3
+jinja2>=3.1.6,<4
+argon2-cffi>=25.1,<26
+Pillow>=12.1,<13
+defusedxml==0.7.1
