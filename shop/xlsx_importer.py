@@ -23,6 +23,8 @@ from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 from PIL import Image, UnidentifiedImageError
 
+from .database import translate_database_busy
+
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_XML_BYTES = 16 * 1024 * 1024
@@ -31,6 +33,17 @@ MAX_XML_NODES = 750_000
 MAX_ROWS = 50_000
 MAX_CELLS = 500_000
 MAX_CELL_TEXT = 32_768
+MAX_SHARED_TEXT_BYTES = 8 * 1024 * 1024
+MAX_EXPANDED_TEXT_BYTES = 32 * 1024 * 1024
+MAX_SHEET_NAME_BYTES = 512
+MAX_BRAND_BYTES = 512
+MAX_MODEL_BYTES = 1024
+MAX_CATEGORY_BYTES = 512
+MAX_COLOR_BYTES = 512
+MAX_BOX_QTY_BYTES = 128
+MAX_DESCRIPTION_BYTES = 64 * 1024
+MAX_COMMENT_BYTES = 8 * 1024
+MAX_BADGE_BYTES = 1024
 MAX_IMAGES = 2_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 150 * 1024 * 1024
@@ -60,10 +73,20 @@ class WorkbookReader:
         self.deadline = time.monotonic() + MAX_IMPORT_SECONDS
         self.xml_bytes = self.nodes = self.rows = self.cells = 0
         self.image_bytes = self.image_pixels = 0
+        self.shared_text_bytes = self.expanded_text_bytes = 0
         self._xml_cache: OrderedDict[str, ET.Element] = OrderedDict()
 
     def check_time(self) -> None:
         _check_deadline(self.deadline)
+
+    def add_expanded_text(self, value: str) -> None:
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeError as exc:
+            raise ValueError("Некорректный Unicode в XLSX") from exc
+        self.expanded_text_bytes += size
+        if self.expanded_text_bytes > MAX_EXPANDED_TEXT_BYTES:
+            raise ImportLimitError("Превышен суммарный лимит развёрнутого текста XLSX")
 
     def namelist(self) -> frozenset[str]:
         return self.names
@@ -176,7 +199,14 @@ def read_shared_strings(zf: WorkbookReader) -> list[str]:
     strings = root.findall(q(NS_MAIN, "si"))
     if len(strings) > 100_000:
         raise ImportLimitError("Слишком много общих строк XLSX")
-    return [get_text(si) for si in strings]
+    result: list[str] = []
+    for item in strings:
+        value = get_text(item)
+        zf.shared_text_bytes += len(value.encode("utf-8"))
+        if zf.shared_text_bytes > MAX_SHARED_TEXT_BYTES:
+            raise ImportLimitError("Превышен лимит хранимого текста общих строк XLSX")
+        result.append(value)
+    return result
 
 
 def col_index(cell_ref: str) -> int:
@@ -191,10 +221,12 @@ def col_index(cell_ref: str) -> int:
     return value - 1
 
 
-def read_cell_value(cell: ET.Element, shared: list[str]) -> Any:
+def read_cell_value(zf: WorkbookReader, cell: ET.Element, shared: list[str]) -> Any:
     cell_type = cell.attrib.get("t")
     if cell_type == "inlineStr":
-        return get_text(cell.find(q(NS_MAIN, "is")))
+        value = get_text(cell.find(q(NS_MAIN, "is")))
+        zf.add_expanded_text(value)
+        return value
     value_node = cell.find(q(NS_MAIN, "v"))
     raw = value_node.text if value_node is not None else None
     if raw is None:
@@ -204,11 +236,16 @@ def read_cell_value(cell: ET.Element, shared: list[str]) -> Any:
             index = int(raw)
             if index < 0:
                 raise ValueError
-            return shared[index]
+            value = shared[index]
         except (ValueError, IndexError):
             raise ValueError("Некорректный индекс общей строки XLSX") from None
+        # Charge each expansion, not only the shared table entry.
+        zf.add_expanded_text(value)
+        return value
     if cell_type == "b":
+        zf.add_expanded_text(raw)
         return raw == "1"
+    zf.add_expanded_text(raw)
     return raw
 
 
@@ -238,7 +275,7 @@ def read_sheet_rows(zf: WorkbookReader, sheet_path: str, shared: list[str]) -> d
             column = col_index(ref)
             if column in values:
                 raise ValueError("Повторяющаяся ячейка XLSX")
-            values[column] = read_cell_value(cell, shared)
+            values[column] = read_cell_value(zf, cell, shared)
         rows[row_num] = values
     return rows
 
@@ -358,6 +395,20 @@ def normalize_title_text(value: Any) -> str:
     return re.sub(r"\s+", " ", normalize_text(value)).strip()
 
 
+def bounded_business_text(value: Any, maximum: int, field: str, *, title: bool = False) -> str:
+    """Enforce UTF-8 field budgets before and after normalization."""
+    raw = "" if value is None else str(value)
+    try:
+        if len(raw.encode("utf-8")) > maximum:
+            raise ImportLimitError(f"Поле {field} превышает лимит текста XLSX")
+    except UnicodeError as exc:
+        raise ValueError("Некорректный Unicode в XLSX") from exc
+    normalized = normalize_title_text(raw) if title else normalize_text(raw)
+    if len(normalized.encode("utf-8")) > maximum:
+        raise ImportLimitError(f"Поле {field} превышает лимит текста XLSX")
+    return normalized
+
+
 def normalize_barcode(value: Any) -> str:
     text = normalize_title_text(value)
     if not text or len(text) > 128 or isinstance(value, bool):
@@ -413,18 +464,24 @@ class ParsedProduct:
     media_paths: list[str]
 
 
-def parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, bytes], list[str]]:
+@dataclass(frozen=True)
+class ValidatedImage:
+    blob: bytes
+    extension: str
+    digest: str
+
+
+def parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, ValidatedImage], list[str]]:
     try:
         return _parse_workbook(path)
     except (zipfile.BadZipFile, zlib.error, NotImplementedError, EOFError) as exc:
         raise ValueError("Файл повреждён или не является XLSX") from exc
 
 
-def _parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, bytes], list[str]]:
+def _parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, ValidatedImage], list[str]]:
     _verify_archive(path)
     products: list[ParsedProduct] = []
-    media: dict[str, bytes] = {}
-    media_hashes: dict[str, str] = {}
+    media: dict[str, ValidatedImage] = {}
     warnings: list[str] = []
     with zipfile.ZipFile(path) as archive:
         zf = WorkbookReader(archive)
@@ -443,6 +500,8 @@ def _parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, by
         for sheet in sheets:
             zf.check_time()
             sheet_name = sheet.attrib.get("name", "Лист")
+            zf.add_expanded_text(sheet_name)
+            bounded_business_text(sheet_name, MAX_SHEET_NAME_BYTES, "название листа", title=True)
             rid = sheet.attrib.get(q(NS_REL_DOC, "id"))
             sheet_path = workbook_rels.get(rid or "")
             if not sheet_path or sheet_path not in zf.namelist():
@@ -455,13 +514,13 @@ def _parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, by
                 warnings.append(f"{sheet_name}: {exc}")
                 continue
             images_by_row = read_image_anchors(zf, sheet_path)
-            brand = normalize_title_text(sheet_name)
+            brand = bounded_business_text(sheet_name, MAX_BRAND_BYTES, "бренд", title=True)
             for row_num in sorted(rows):
                 zf.check_time()
                 if row_num <= header_row:
                     continue
                 row = rows[row_num]
-                model = normalize_title_text(row.get(columns["model"]))
+                model = bounded_business_text(row.get(columns["model"]), MAX_MODEL_BYTES, "модель", title=True)
                 barcode = normalize_barcode(row.get(columns["barcode"]))
                 price_cents = parse_price_cents(row.get(columns["price"]))
                 if not (model and barcode and price_cents):
@@ -483,30 +542,36 @@ def _parse_workbook(path: str | Path) -> tuple[list[ParsedProduct], dict[str, by
                             raise ImportLimitError("В XLSX слишком много изображений")
                         blob = zf.read(media_path, MAX_IMAGE_BYTES)
                         zf.image_bytes += len(blob)
-                        _extension, decoded_pixels = _validate_image(blob, deadline=zf.deadline)
+                        extension, decoded_pixels = _validate_image(blob, deadline=zf.deadline)
                         zf.image_pixels += decoded_pixels
                         if zf.image_bytes > MAX_TOTAL_IMAGE_BYTES or zf.image_pixels > MAX_TOTAL_IMAGE_PIXELS:
                             raise ImportLimitError("Превышен суммарный лимит изображений XLSX")
-                        media[media_path] = blob
-                        media_hashes[media_path] = hashlib.sha256(blob).hexdigest()
-                    blob = media[media_path]
-                    digest = media_hashes[media_path]
+                        media[media_path] = ValidatedImage(
+                            blob=blob, extension=extension, digest=hashlib.sha256(blob).hexdigest()
+                        )
+                    image = media[media_path]
+                    digest = image.digest
                     if digest in seen_hashes:
                         continue
                     seen_hashes.add(digest)
                     dedup_media.append(media_path)
-                    media.setdefault(media_path, blob)
-                comment = normalize_text(row.get(columns.get("comment", -1))) if "comment" in columns else ""
+                comment = (bounded_business_text(row.get(columns.get("comment", -1)), MAX_COMMENT_BYTES,
+                                                 "комментарий") if "comment" in columns else "")
                 badge = "Новинка" if "новин" in comment.lower() else comment
+                badge = bounded_business_text(badge, MAX_BADGE_BYTES, "метка")
                 products.append(ParsedProduct(
                     brand=brand,
-                    category=normalize_title_text(row.get(columns.get("category", -1))),
+                    category=bounded_business_text(row.get(columns.get("category", -1)), MAX_CATEGORY_BYTES,
+                                                   "категория", title=True),
                     model=model,
-                    color=normalize_title_text(row.get(columns.get("color", -1))),
+                    color=bounded_business_text(row.get(columns.get("color", -1)), MAX_COLOR_BYTES,
+                                                "цвет", title=True),
                     barcode=barcode,
-                    box_qty=normalize_title_text(row.get(columns.get("box_qty", -1))),
+                    box_qty=bounded_business_text(row.get(columns.get("box_qty", -1)), MAX_BOX_QTY_BYTES,
+                                                  "количество в коробке", title=True),
                     price_cents=price_cents,
-                    description=normalize_text(row.get(columns.get("description", -1))),
+                    description=bounded_business_text(row.get(columns.get("description", -1)),
+                                                      MAX_DESCRIPTION_BYTES, "описание"),
                     badge=badge,
                     sheet_name=sheet_name,
                     row_number=row_num,
@@ -661,34 +726,66 @@ def _image_extension(media_path: str, blob: bytes) -> str:
     return _validate_image(blob)[0]
 
 
-def _save_image(
-    blob: bytes, media_path: str, upload_root: str | Path,
-    created: set[Path] | None = None,
-    *, deadline: float | None = None,
-) -> str:
-    digest = hashlib.sha256(blob).hexdigest()
-    extension = _validate_image(blob, deadline=deadline)[0]
-    relative = Path("products") / digest[:2] / f"{digest}{extension}"
+@dataclass
+class PreparedImage:
+    url: str
+    absolute: Path
+    temporary: Path | None
+
+    def publish(self, created: set[Path]) -> None:
+        if self.temporary is None:
+            return
+        if self.absolute.exists():
+            self.temporary.unlink(missing_ok=True)
+        else:
+            self.temporary.replace(self.absolute)
+            created.add(self.absolute)
+        self.temporary = None
+
+    def cleanup(self) -> None:
+        if self.temporary is not None:
+            self.temporary.unlink(missing_ok=True)
+            self.temporary = None
+
+
+def _prepare_image(image: ValidatedImage, upload_root: str | Path) -> PreparedImage:
+    """Write validated bytes before the SQLite writer transaction starts."""
+    relative = Path("products") / image.digest[:2] / f"{image.digest}{image.extension}"
     absolute = Path(upload_root) / relative
     if not absolute.resolve().is_relative_to(Path(upload_root).resolve()):
         raise ValueError("Недопустимый путь изображения")
+    temporary: Path | None = None
     if not absolute.exists():
         absolute.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=absolute.parent, suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             try:
-                stream.write(blob)
+                stream.write(image.blob)
             except BaseException:
                 stream.close()
                 temporary.unlink(missing_ok=True)
                 raise
-        try:
-            temporary.replace(absolute)
-            if created is not None:
-                created.add(absolute)
-        finally:
-            temporary.unlink(missing_ok=True)
-    return "/media/" + relative.as_posix()
+    return PreparedImage("/media/" + relative.as_posix(), absolute, temporary)
+
+
+def _prepare_images(
+    media: dict[str, ValidatedImage], upload_root: str | Path,
+) -> tuple[dict[str, PreparedImage], list[PreparedImage]]:
+    by_identity: dict[tuple[str, str], PreparedImage] = {}
+    by_media_path: dict[str, PreparedImage] = {}
+    try:
+        for media_path, image in media.items():
+            identity = (image.digest, image.extension)
+            prepared = by_identity.get(identity)
+            if prepared is None:
+                prepared = _prepare_image(image, upload_root)
+                by_identity[identity] = prepared
+            by_media_path[media_path] = prepared
+        return by_media_path, list(by_identity.values())
+    except BaseException:
+        for prepared in by_identity.values():
+            prepared.cleanup()
+        raise
 
 
 def _display_price(source_price_cents: int, multiplier: Decimal) -> int:
@@ -727,15 +824,21 @@ def import_xlsx(
     result = ImportResult(filename=filename, warnings=list(warnings))
     created: set[Path] = set()
     brands_seen: dict[str, set[str]] = {}
-    # The savepoint allows cleanup against the pre-import catalog while retaining
-    # the SQLite writer lock, so another import cannot adopt a file being removed.
-    connection.execute("BEGIN IMMEDIATE")
-    connection.execute("SAVEPOINT catalog_import")
+    prepared_by_path, prepared_images = _prepare_images(media, upload_root)
+    transaction_started = False
+    savepoint_started = False
     try:
-        image_urls: dict[str, str] = {
-            media_path: _save_image(blob, media_path, upload_root, created, deadline=deadline)
-            for media_path, blob in media.items()
-        }
+        _check_deadline(deadline)
+        # Parsing, image decoding and temporary file writes are complete. The
+        # writer lock now covers only quick publication and catalog mutations.
+        with translate_database_busy():
+            connection.execute("BEGIN IMMEDIATE")
+        transaction_started = True
+        connection.execute("SAVEPOINT catalog_import")
+        savepoint_started = True
+        for prepared in prepared_images:
+            prepared.publish(created)
+        image_urls = {media_path: prepared.url for media_path, prepared in prepared_by_path.items()}
         result.image_count = len(image_urls)
         for product in products:
             _check_deadline(deadline)
@@ -852,19 +955,24 @@ def import_xlsx(
         )
         connection.commit()
     except BaseException:
-        try:
-            connection.execute("ROLLBACK TO SAVEPOINT catalog_import")
-            root = Path(upload_root).resolve()
-            for image_path in created:
-                if not image_path.resolve().is_relative_to(root):
-                    continue
-                url = "/media/" + image_path.resolve().relative_to(root).as_posix()
-                in_use = connection.execute(
-                    "SELECT 1 FROM products WHERE instr(images_json, ?) > 0 LIMIT 1", (url,),
-                ).fetchone()
-                if not in_use:
-                    image_path.unlink(missing_ok=True)
-        finally:
-            connection.rollback()
+        if transaction_started:
+            try:
+                if savepoint_started:
+                    connection.execute("ROLLBACK TO SAVEPOINT catalog_import")
+                    root = Path(upload_root).resolve()
+                    for image_path in created:
+                        if not image_path.resolve().is_relative_to(root):
+                            continue
+                        url = "/media/" + image_path.resolve().relative_to(root).as_posix()
+                        in_use = connection.execute(
+                            "SELECT 1 FROM products WHERE instr(images_json, ?) > 0 LIMIT 1", (url,),
+                        ).fetchone()
+                        if not in_use:
+                            image_path.unlink(missing_ok=True)
+            finally:
+                connection.rollback()
         raise
+    finally:
+        for prepared in prepared_images:
+            prepared.cleanup()
     return result

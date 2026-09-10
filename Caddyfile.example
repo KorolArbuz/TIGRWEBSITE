@@ -3,6 +3,12 @@
 	log default {
 		output discard
 	}
+	# Reject slow/incomplete request headers before proxying to the application.
+	servers {
+		timeouts {
+			read_header 10s
+		}
+	}
 }
 
 {$DOMAIN} {

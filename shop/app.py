@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import csv
 import hmac
-import io
 import json
 import math
 import os
@@ -21,13 +19,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.formparsers import MultiPartException
 from python_multipart.exceptions import MultipartParseError, ParseError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
+                               Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
-from .database import connect, init_db
+from .csv_export import OrdersCsvExport
+from .database import DatabaseBusyError, connect, init_db, translate_database_busy
 from .import_service import ImportBusyError, ImportLimitError, run_imports
 from .orders import CheckoutError, OutboxWorker, create_checkout, normalize_checkout
 from .security import (ADMIN_COOKIE, AdminGate, BoundedFormParser, BoundedMultiPartParser, BodyLimitExceeded,
@@ -171,14 +171,6 @@ def _parse_price_to_cents(value: str) -> int:
     return int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def _csv_cell(value: Any) -> str:
-    """Prevent spreadsheet formula execution when exported CSV is opened."""
-    text = str(value or "")
-    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
-        return "'" + text
-    return text
-
-
 def _ensure_csrf(request: Request) -> str:
     token = request.session.get("csrf_token")
     if not token:
@@ -299,6 +291,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             "ADMIN_IDLE_SECONDS": 1800, "ADMIN_ABSOLUTE_SECONDS": 28800,
             "LOGIN_RATE_LIMIT": 20, "LOGIN_RATE_WINDOW": 300,
             "CHECKOUT_RATE_LIMIT": 60, "CHECKOUT_RATE_WINDOW": 600,
+            "FORM_BODY_IDLE_SECONDS": 30, "FORM_BODY_TOTAL_SECONDS": 180,
+            "IMPORT_BODY_IDLE_SECONDS": 90, "IMPORT_BODY_TOTAL_SECONDS": 1800,
         }.items()},
         "PER_PAGE": 36,
     }
@@ -323,7 +317,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         finally:
             await anyio.to_thread.run_sync(worker.stop)
 
-    app = SecureFastAPI(title="ХОКО Каталог", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app = SecureFastAPI(title="ХОКО Каталог", docs_url=None, redoc_url=None, openapi_url=None,
+                        lifespan=lifespan, security_settings=settings)
     app.state.login_limiter = anyio.CapacityLimiter(2)
     app.state.import_limiter = anyio.CapacityLimiter(1)
     app.add_middleware(AdminGate, settings=settings)
@@ -717,7 +712,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             _flash(request, "Неизвестный статус", "error")
             return RedirectResponse(url=f"/admin/orders/{order_id}", status_code=303)
         def update_order() -> None:
-            with closing(connect(settings["DATABASE_PATH"])) as db, db:
+            with translate_database_busy(), closing(connect(settings["DATABASE_PATH"])) as db, db:
                 cursor = db.execute(
                     "UPDATE orders SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
                     (status, order_id),
@@ -779,7 +774,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
             return RedirectResponse(url="/admin/products", status_code=303)
         active = 1 if str(form.get("active", "")) == "1" else 0
         def update_product() -> str:
-            with closing(connect(settings["DATABASE_PATH"])) as db, db:
+            with translate_database_busy(), closing(connect(settings["DATABASE_PATH"])) as db, db:
                 row = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
                 if row is None:
                     raise HTTPException(status_code=404, detail="Товар не найден")
@@ -794,53 +789,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         return RedirectResponse(url="/admin/products", status_code=303)
 
     @app.get("/admin/export/orders.csv", name="admin_orders_csv")
-    def admin_orders_csv(request: Request) -> Response:
+    async def admin_orders_csv(request: Request) -> Response:
         if not _admin_authenticated(request):
             return _admin_redirect(request)
-        with closing(connect(settings["DATABASE_PATH"])) as db:
-            rows = db.execute(
-                """
-                SELECT o.order_number, o.created_at, o.status, o.customer_name, o.phone, o.telegram,
-                       o.delivery_method, o.address, o.payment_method, o.total_cents,
-                       o.personal_data_consent, o.privacy_policy_version, o.personal_data_consent_at,
-                       i.barcode, i.title, i.unit_price_cents, i.quantity, i.subtotal_cents
-                FROM orders o
-                JOIN order_items i ON i.order_id = o.id
-                ORDER BY o.id DESC, i.id
-                """
-            ).fetchall()
-        stream = io.StringIO()
-        writer = csv.writer(stream, delimiter=";")
-        writer.writerow([
-            "Заказ", "Дата", "Статус", "Клиент", "Телефон", "Telegram",
-            "Получение", "Адрес", "Оплата", "Итого заказа", "Согласие ПД",
-            "Версия политики", "Дата согласия", "Штрихкод", "Товар", "Цена",
-            "Количество", "Сумма позиции",
-        ])
-        for row in rows:
-            writer.writerow([
-                _csv_cell(row["order_number"]),
-                _csv_cell(row["created_at"]),
-                _csv_cell(ORDER_STATUSES.get(row["status"], row["status"])),
-                _csv_cell(row["customer_name"]),
-                _csv_cell(row["phone"]),
-                _csv_cell(row["telegram"]),
-                _csv_cell(DELIVERY_METHODS.get(row["delivery_method"], row["delivery_method"])),
-                _csv_cell(row["address"]),
-                _csv_cell(PAYMENT_METHODS.get(row["payment_method"], row["payment_method"])),
-                f"{row['total_cents'] / 100:.2f}",
-                "Да" if row["personal_data_consent"] else "Нет",
-                _csv_cell(row["privacy_policy_version"]),
-                _csv_cell(row["personal_data_consent_at"]),
-                _csv_cell(row["barcode"]),
-                _csv_cell(row["title"]),
-                f"{row['unit_price_cents'] / 100:.2f}",
-                row["quantity"],
-                f"{row['subtotal_cents'] / 100:.2f}",
-            ])
-        data = ("\ufeff" + stream.getvalue()).encode("utf-8")
-        return Response(
-            content=data,
+        export = OrdersCsvExport(
+            settings["DATABASE_PATH"], ORDER_STATUSES, DELIVERY_METHODS, PAYMENT_METHODS,
+        )
+        first = await export.start()
+        return StreamingResponse(
+            export.body(first),
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": "attachment; filename=orders.csv"},
         )
@@ -853,5 +810,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> FastAPI:
         response = render(request, "error.html", status_code=exc.status_code, code=exc.status_code, message=message)
         response.headers.update(exc.headers or {})
         return response
+
+    @app.exception_handler(DatabaseBusyError)
+    async def database_busy_handler(request: Request, _exc: DatabaseBusyError) -> Response:
+        headers = {"Retry-After": "1", "Cache-Control": "no-store"}
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "Сервис временно занят. Повторите запрос."},
+                                status_code=503, headers=headers)
+        return PlainTextResponse("Сервис временно занят. Повторите запрос.", status_code=503, headers=headers)
 
     return app

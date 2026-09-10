@@ -1,8 +1,31 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+DEFAULT_BUSY_TIMEOUT_MS = 3_000
+
+
+class DatabaseBusyError(RuntimeError):
+    """A short-lived SQLite lock that callers may safely retry."""
+
+
+def is_database_busy(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        marker in str(exc).lower() for marker in ("database is locked", "database table is locked", "database is busy")
+    )
+
+
+@contextmanager
+def translate_database_busy() -> Iterator[None]:
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        if is_database_busy(exc):
+            raise DatabaseBusyError("Database is temporarily busy") from exc
+        raise
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -137,20 +160,24 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
+def connect(path: str | Path, *, busy_timeout_ms: int | None = None) -> sqlite3.Connection:
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=30)
+    timeout_ms = DEFAULT_BUSY_TIMEOUT_MS if busy_timeout_ms is None else busy_timeout_ms
+    if type(timeout_ms) is not int or not 1 <= timeout_ms <= 60_000:
+        raise ValueError("Invalid SQLite busy timeout")
+    connection = sqlite3.connect(db_path, timeout=timeout_ms / 1000)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 30000")
+    # SQLite does not accept a bound PRAGMA value; timeout_ms was type/range validated above.
+    connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")  # nosec B608
     return connection
 
 
 def init_db(path: str | Path) -> None:
     connection = connect(path)
     try:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
         # Lightweight forward-only migrations for databases created by earlier builds.
         # Serialize inspection and ALTER together when multiple workers start.

@@ -6,7 +6,9 @@ import json
 import struct
 import subprocess
 import sys
+import threading
 import zipfile
+from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -15,6 +17,7 @@ import pytest
 from PIL import Image
 
 from shop.database import connect, init_db
+from shop.orders import create_checkout
 from shop import import_service
 from shop import xlsx_importer as importer
 
@@ -331,3 +334,190 @@ def test_import_lock_cross_process_and_release(tmp_path):
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     with import_service.import_slot(media):
         pass
+
+
+def text_budget_workbook(path: Path, *, cell_kind: str = "shared", sheet_count: int = 1,
+                         repeats: int = 2) -> Path:
+    model = "Ж" * 20
+    shared = ""
+    if cell_kind in {"shared", "rich"}:
+        item = (f"<si><t>{model}</t></si>" if cell_kind == "shared" else
+                f"<si><r><t>{model[:10]}</t></r><r><t>{model[10:]}</t></r></si>")
+        shared = f'<sst xmlns="{importer.NS_MAIN}">{item}</sst>'
+
+    sheets_xml = []
+    relationships = []
+    additional: dict[str, str] = {}
+    for sheet_number in range(1, sheet_count + 1):
+        sheets_xml.append(f'<sheet name="S{sheet_number}" sheetId="{sheet_number}" r:id="rId{sheet_number}"/>')
+        relationships.append(
+            f'<Relationship Id="rId{sheet_number}" Target="worksheets/sheet{sheet_number}.xml" Type="worksheet"/>'
+        )
+        rows = []
+        for offset in range(repeats):
+            row_number = offset + 2
+            model_cell = (f'<c r="A{row_number}" t="s"><v>0</v></c>'
+                          if cell_kind in {"shared", "rich"} else
+                          f'<c r="A{row_number}" t="inlineStr"><is><t>{model}</t></is></c>')
+            barcode = f"{sheet_number:02d}{offset:011d}"
+            rows.append(
+                f'<row r="{row_number}">{model_cell}'
+                f'<c r="B{row_number}" t="inlineStr"><is><t>{barcode}</t></is></c>'
+                f'<c r="C{row_number}"><v>10</v></c></row>'
+            )
+        additional[f"xl/worksheets/sheet{sheet_number}.xml"] = (
+            f'<worksheet xmlns="{importer.NS_MAIN}"><sheetData><row r="1">'
+            '<c r="A1" t="inlineStr"><is><t>Модель</t></is></c>'
+            '<c r="B1" t="inlineStr"><is><t>Штрихкод</t></is></c>'
+            '<c r="C1" t="inlineStr"><is><t>Цена</t></is></c></row>'
+            + "".join(rows) + '</sheetData></worksheet>'
+        )
+    additional["xl/workbook.xml"] = (
+        f'<workbook xmlns="{importer.NS_MAIN}" xmlns:r="{importer.NS_REL_DOC}"><sheets>'
+        + "".join(sheets_xml) + '</sheets></workbook>'
+    )
+    additional["xl/_rels/workbook.xml.rels"] = (
+        f'<Relationships xmlns="{importer.NS_REL_PKG}">' + "".join(relationships) + '</Relationships>'
+    )
+    if shared:
+        additional["xl/sharedStrings.xml"] = shared
+    return workbook(path, additional=additional)
+
+
+@pytest.mark.parametrize("cell_kind", ["shared", "inline", "rich"])
+def test_expanded_text_budget_counts_each_utf8_cell_use_before_import(tmp_path, catalog, monkeypatch, cell_kind):
+    connection, _database, media = catalog
+    path = text_budget_workbook(tmp_path / f"{cell_kind}.xlsx", cell_kind=cell_kind, repeats=4)
+    monkeypatch.setattr(importer, "MAX_EXPANDED_TEXT_BYTES", 180)
+    with pytest.raises(importer.ImportLimitError, match="развёрнутого текста"):
+        importer.import_xlsx(connection, path, media)
+    assert connection.execute("SELECT count(*) FROM products").fetchone()[0] == 0
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_expanded_text_budget_is_summed_across_sheets(tmp_path, catalog, monkeypatch):
+    connection, _database, media = catalog
+    path = text_budget_workbook(tmp_path / "sheets.xlsx", sheet_count=2, repeats=1)
+    monkeypatch.setattr(importer, "MAX_EXPANDED_TEXT_BYTES", 150)
+    with pytest.raises(importer.ImportLimitError, match="развёрнутого текста"):
+        importer.import_xlsx(connection, path, media)
+    assert connection.execute("SELECT count(*) FROM products").fetchone()[0] == 0
+
+
+def test_shared_string_storage_and_business_utf8_budgets_are_separate(tmp_path, catalog, monkeypatch):
+    connection, _database, media = catalog
+    shared_path = text_budget_workbook(tmp_path / "stored.xlsx", cell_kind="rich", repeats=1)
+    monkeypatch.setattr(importer, "MAX_SHARED_TEXT_BYTES", 20)
+    with pytest.raises(importer.ImportLimitError, match="хранимого текста"):
+        importer.import_xlsx(connection, shared_path, media)
+
+    monkeypatch.setattr(importer, "MAX_SHARED_TEXT_BYTES", 1024)
+    monkeypatch.setattr(importer, "MAX_MODEL_BYTES", 20)
+    with pytest.raises(importer.ImportLimitError, match="модель"):
+        importer.import_xlsx(connection, shared_path, media)
+    assert connection.execute("SELECT count(*) FROM products").fetchone()[0] == 0
+
+
+def test_delayed_import_preparation_does_not_hold_writer_lock(tmp_path, catalog, monkeypatch):
+    connection, database, media = catalog
+    connection.execute(
+        "INSERT INTO products(barcode,brand,model,source_price_cents,price_cents) "
+        "VALUES ('checkout-during-import','Example','Checkout product',100,100)"
+    )
+    connection.commit()
+    source = text_budget_workbook(tmp_path / "delayed.xlsx", cell_kind="inline", repeats=1)
+    entered, release = threading.Event(), threading.Event()
+    original = importer._prepare_images
+
+    def delayed_prepare(*args, **kwargs):
+        prepared = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(timeout=5)
+        return prepared
+
+    monkeypatch.setattr(importer, "_prepare_images", delayed_prepare)
+    outcomes = []
+
+    def run_import():
+        with closing(connect(database)) as worker_db:
+            outcomes.append(importer.import_xlsx(worker_db, source, media))
+
+    worker = threading.Thread(target=run_import)
+    worker.start()
+    assert entered.wait(timeout=5)
+    try:
+        result = create_checkout(
+            database, "s" * 32, "k" * 32,
+            {"customer_name": "Buyer", "phone": "0000000000", "telegram": "",
+             "delivery_method": "pickup", "payment_method": "manager", "address": "", "comment": "",
+             "personal_data_consent": True, "cart": [{"id": 1, "quantity": 1}]},
+            "synthetic-v1", notify=False,
+        )
+        assert result.order_id > 0
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert len(outcomes) == 1 and outcomes[0].inserted == 1
+
+
+def test_import_image_is_fully_decoded_once_before_transaction(tmp_path, catalog, monkeypatch):
+    connection, _database, media = catalog
+    source = workbook(tmp_path / "once.xlsx", blob=image_bytes())
+    calls = 0
+    original = importer._validate_image
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(importer, "_validate_image", counted)
+    assert importer.import_xlsx(connection, source, media).inserted == 1
+    assert calls == 1
+
+
+def business_fields_workbook(path: Path, *, target: str) -> Path:
+    fields = {
+        "category": "Category", "model": "Model", "color": "Black", "barcode": "0012345678901",
+        "box": "10", "price": "12.50", "description": "Description", "comment": "Comment",
+    }
+    sheet_name = "Brand"
+    if target in fields:
+        fields[target] = "abc" if target == "comment" else "ЖЖ"
+    elif target in {"sheet", "brand"}:
+        sheet_name = "ЖЖ"
+    headers = ["Категория", "Модель", "Цвет", "Штрихкод", "Шт. в кор.", "Цена", "Описание", "Комментарий"]
+    keys = ["category", "model", "color", "barcode", "box", "price", "description", "comment"]
+    header_cells = "".join(
+        f'<c r="{chr(65 + column)}1" t="inlineStr"><is><t>{value}</t></is></c>'
+        for column, value in enumerate(headers)
+    )
+    value_cells = "".join(
+        (f'<c r="{chr(65 + column)}2"><v>{escape(fields[key])}</v></c>' if key == "price" else
+         f'<c r="{chr(65 + column)}2" t="inlineStr"><is><t>{escape(fields[key])}</t></is></c>')
+        for column, key in enumerate(keys)
+    )
+    return workbook(path, additional={
+        "xl/workbook.xml": f'<workbook xmlns="{importer.NS_MAIN}" xmlns:r="{importer.NS_REL_DOC}">'
+                           f'<sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        "xl/worksheets/sheet1.xml": f'<worksheet xmlns="{importer.NS_MAIN}"><sheetData>'
+                                      f'<row r="1">{header_cells}</row><row r="2">{value_cells}</row>'
+                                      '</sheetData></worksheet>',
+    })
+
+
+@pytest.mark.parametrize(("target", "constant"), [
+    ("sheet", "MAX_SHEET_NAME_BYTES"), ("brand", "MAX_BRAND_BYTES"),
+    ("model", "MAX_MODEL_BYTES"), ("category", "MAX_CATEGORY_BYTES"),
+    ("color", "MAX_COLOR_BYTES"), ("box", "MAX_BOX_QTY_BYTES"),
+    ("description", "MAX_DESCRIPTION_BYTES"), ("comment", "MAX_COMMENT_BYTES"),
+    ("comment", "MAX_BADGE_BYTES"),
+])
+def test_each_business_text_field_has_utf8_byte_budget(tmp_path, catalog, monkeypatch, target, constant):
+    connection, _database, media = catalog
+    source = business_fields_workbook(tmp_path / f"{constant}.xlsx", target=target)
+    monkeypatch.setattr(importer, constant, 2)
+    with pytest.raises(importer.ImportLimitError):
+        importer.import_xlsx(connection, source, media)
+    assert connection.execute("SELECT count(*) FROM products").fetchone()[0] == 0

@@ -7,6 +7,7 @@ import io
 import json
 import re
 import secrets
+import sqlite3
 import string
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -67,6 +68,9 @@ def security_headers(headers):
     {"SECRET_KEY": string.ascii_lowercase + string.ascii_uppercase + string.digits + "-_"},
     {"ADMIN_PASSWORD_HASH": ""}, {"ADMIN_PASSWORD": "change-me-now"},
     {"SESSION_COOKIE_SECURE": False}, {"APP_ENV": "unknown"}, {"ALLOWED_HOSTS": "*"},
+    {"FORM_BODY_IDLE_SECONDS": 0},
+    {"FORM_BODY_IDLE_SECONDS": 10, "FORM_BODY_TOTAL_SECONDS": 9},
+    {"IMPORT_BODY_IDLE_SECONDS": float("nan")},
 ])
 def test_unsafe_production_config_fails_before_database_creation(app_config, changes):
     settings = {**app_config, "APP_ENV": "production", "SESSION_COOKIE_SECURE": True, **changes}
@@ -272,6 +276,37 @@ async def raw_request(app, *, path, chunks, cookie="", content_length=None):
     return start["status"], {key.decode(): value.decode() for key, value in start["headers"]}, consumed
 
 
+async def timed_raw_request(app, *, path, events, cookie="", content_type="application/x-www-form-urlencoded",
+                            disconnect=False):
+    headers = [(b"host", b"testserver"), (b"content-type", content_type.encode("ascii"))]
+    if cookie:
+        headers.append((b"cookie", cookie.encode("ascii")))
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+             "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+             "root_path": "", "headers": headers, "client": ("192.0.2.21", 10001),
+             "server": ("testserver", 80)}
+    pending = list(events)
+    messages = []
+
+    async def receive():
+        if pending:
+            delay, body, more_body = pending.pop(0)
+            if delay:
+                await asyncio.sleep(delay)
+            return {"type": "http.request", "body": body, "more_body": more_body}
+        if disconnect:
+            return {"type": "http.disconnect"}
+        await asyncio.sleep(3600)
+
+    async def send(message):
+        messages.append(message)
+
+    await asyncio.wait_for(app(scope, receive, send), timeout=3)
+    starts = [message for message in messages if message["type"] == "http.response.start"]
+    assert len(starts) == 1
+    return starts[0]["status"], messages
+
+
 @pytest.mark.parametrize("path,limit", [("/admin/login", LOGIN_BODY_BYTES), ("/checkout", FORM_BODY_BYTES)])
 def test_streamed_body_limit_without_content_length(app, client, path, limit):
     csrf = hidden(client.get(path), "csrf_token")
@@ -292,6 +327,106 @@ def test_content_length_is_only_early_optimization(app, client):
                                                cookie=cookie, content_length=b"1"))
     assert status == 413
     security_headers(headers)
+
+
+def test_body_idle_total_and_disconnect_deadlines_are_408(app_config):
+    timed_app = create_app({**app_config, "FORM_BODY_IDLE_SECONDS": 0.05,
+                            "FORM_BODY_TOTAL_SECONDS": 0.14})
+    with TestClient(timed_app, follow_redirects=False) as timed_client:
+        csrf = hidden(timed_client.get("/admin/login"), "csrf_token")
+        cookie = "session=" + timed_client.cookies.get("session")
+        prefix = ("csrf_token=" + csrf + "&password=").encode()
+        idle_status, _ = asyncio.run(timed_raw_request(
+            timed_app, path="/admin/login", cookie=cookie, events=[(0, prefix, True)],
+        ))
+        disconnect_status, _ = asyncio.run(timed_raw_request(
+            timed_app, path="/admin/login", cookie=cookie, events=[(0, prefix, True)], disconnect=True,
+        ))
+        drip = [(0, prefix, True), *[(0.03, b"x", True) for _ in range(8)]]
+        total_status, _ = asyncio.run(timed_raw_request(
+            timed_app, path="/admin/login", cookie=cookie, events=drip,
+        ))
+        assert (idle_status, disconnect_status, total_status) == (408, 408, 408)
+        valid = timed_client.post("/admin/login", data={"csrf_token": csrf, "password": "wrong"})
+        assert valid.status_code == 303
+
+
+def test_slow_import_budget_and_stalled_import_release_upload_lock(app_config, admin_credentials):
+    timed_app = create_app({**app_config, "FORM_BODY_IDLE_SECONDS": 0.04, "FORM_BODY_TOTAL_SECONDS": 0.2,
+                            "IMPORT_BODY_IDLE_SECONDS": 0.2, "IMPORT_BODY_TOTAL_SECONDS": 2})
+    with TestClient(timed_app, follow_redirects=False) as timed_client:
+        login(timed_client, admin_credentials[0])
+        csrf = hidden(timed_client.get("/admin"), "csrf_token")
+        cookie = "; ".join(f"{key}={value}" for key, value in timed_client.cookies.items())
+        body = (multipart_file_prefix() + b"\r\n--synthetic-boundary\r\n"
+                + b'Content-Disposition: form-data; name="csrf_token"\r\n\r\n' + csrf.encode()
+                + b"\r\n--synthetic-boundary--\r\n")
+        quarter = len(body) // 4
+        events = [(0 if offset == 0 else 0.06, body[offset:offset + quarter], True)
+                  for offset in range(0, len(body), quarter)]
+        events[-1] = (events[-1][0], events[-1][1], False)
+        status, _ = asyncio.run(timed_raw_request(
+            timed_app, path="/admin/import", cookie=cookie, events=events,
+            content_type="multipart/form-data; boundary=synthetic-boundary",
+        ))
+        assert status == 303
+
+        stalled, _ = asyncio.run(timed_raw_request(
+            timed_app, path="/admin/import", cookie=cookie,
+            events=[(0, multipart_file_prefix(), True)],
+            content_type="multipart/form-data; boundary=synthetic-boundary",
+        ))
+        assert stalled == 408
+        from shop.import_service import upload_slot
+        with upload_slot(app_config["UPLOAD_ROOT"]):
+            pass
+
+
+def test_parallel_stalled_requests_leave_service_recoverable(app_config):
+    timed_app = create_app({**app_config, "FORM_BODY_IDLE_SECONDS": 0.05,
+                            "FORM_BODY_TOTAL_SECONDS": 0.3})
+    with TestClient(timed_app, follow_redirects=False) as timed_client:
+        csrf = hidden(timed_client.get("/admin/login"), "csrf_token")
+        cookie = "session=" + timed_client.cookies.get("session")
+        prefix = ("csrf_token=" + csrf + "&password=").encode()
+
+        async def stalled_batch():
+            return await asyncio.gather(*[
+                timed_raw_request(timed_app, path="/admin/login", cookie=cookie,
+                                  events=[(0, prefix, True)]) for _ in range(4)
+            ])
+
+        results = asyncio.run(stalled_batch())
+        assert [status for status, _messages in results] == [408] * 4
+        assert timed_client.get("/healthz").status_code == 200
+
+
+def test_short_database_busy_is_retryable_503_and_checkout_remains_idempotent(app_config, monkeypatch):
+    import shop.database as database_module
+
+    monkeypatch.setattr(database_module, "DEFAULT_BUSY_TIMEOUT_MS", 50)
+    busy_app = create_app(app_config)
+    with closing(connect(app_config["DATABASE_PATH"])) as db, db:
+        db.execute("INSERT INTO products(barcode,brand,model,source_price_cents,price_cents) "
+                   "VALUES ('busy-synthetic','Example','Busy product',1,100)")
+    with TestClient(busy_app, follow_redirects=False) as busy_client:
+        data = checkout_data(busy_client)
+        blocker = sqlite3.connect(app_config["DATABASE_PATH"], timeout=1)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            response = busy_client.post("/checkout", data=data)
+            assert response.status_code == 503
+            assert response.headers["retry-after"] == "1"
+            assert response.headers["cache-control"] == "no-store"
+        finally:
+            blocker.rollback()
+            blocker.close()
+        first = busy_client.post("/checkout", data=data)
+        replay = busy_client.post("/checkout", data=data)
+        assert first.status_code == replay.status_code == 303
+        assert first.headers["location"] == replay.headers["location"]
+    with closing(connect(app_config["DATABASE_PATH"])) as db:
+        assert db.execute("SELECT count(*) FROM orders").fetchone()[0] == 1
 
 
 def test_host_allowlist_and_404_500_keep_security_headers(app, client):

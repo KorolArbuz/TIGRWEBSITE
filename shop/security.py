@@ -20,7 +20,7 @@ from starlette.formparsers import FormParser, MultiPartException, MultiPartParse
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, RedirectResponse
 
-from .database import connect
+from .database import DatabaseBusyError, connect, translate_database_busy
 from .import_service import ImportBusyError, upload_slot
 
 ADMIN_COOKIE = "tigr_admin"
@@ -29,6 +29,10 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 LOGIN_BODY_BYTES = 16 * 1024
 FORM_BODY_BYTES = 64 * 1024
 IMPORT_BODY_BYTES = 128 * 1024 * 1024
+FORM_BODY_IDLE_SECONDS = 30.0
+FORM_BODY_TOTAL_SECONDS = 180.0
+IMPORT_BODY_IDLE_SECONDS = 90.0
+IMPORT_BODY_TOTAL_SECONDS = 1800.0
 
 
 def password_bytes(value: str) -> bytes:
@@ -109,6 +113,23 @@ def validate_settings(settings: dict[str, Any]) -> None:
         if not 1 <= value <= maximum:
             raise ValueError(f"Invalid {name}")
         settings[name] = value
+    for name, default, maximum in (
+        ("FORM_BODY_IDLE_SECONDS", FORM_BODY_IDLE_SECONDS, 600.0),
+        ("FORM_BODY_TOTAL_SECONDS", FORM_BODY_TOTAL_SECONDS, 3600.0),
+        ("IMPORT_BODY_IDLE_SECONDS", IMPORT_BODY_IDLE_SECONDS, 1800.0),
+        ("IMPORT_BODY_TOTAL_SECONDS", IMPORT_BODY_TOTAL_SECONDS, 7200.0),
+    ):
+        try:
+            value = float(settings.get(name, default))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid {name}") from exc
+        minimum = 0.01 if mode == "test" else 1.0
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(f"Invalid {name}")
+        settings[name] = value
+    if (settings["FORM_BODY_TOTAL_SECONDS"] < settings["FORM_BODY_IDLE_SECONDS"]
+            or settings["IMPORT_BODY_TOTAL_SECONDS"] < settings["IMPORT_BODY_IDLE_SECONDS"]):
+        raise ValueError("Request body total deadline must not be shorter than its idle deadline")
     settings["CREDENTIAL_VERSION"] = hmac.new(
         secret.encode("utf-8"), encoded_hash.encode("utf-8"), hashlib.sha256
     ).hexdigest()
@@ -131,7 +152,7 @@ def _token_hash(token: str) -> str:
 def create_admin_session(settings: dict[str, Any]) -> str:
     token = secrets.token_urlsafe(32)
     now = time.time()
-    with closing(connect(settings["DATABASE_PATH"])) as db, db:
+    with translate_database_busy(), closing(connect(settings["DATABASE_PATH"])) as db, db:
         db.execute("BEGIN IMMEDIATE")
         version = db.execute("SELECT value FROM security_state WHERE key='admin_credentials'").fetchone()
         if version is None or version[0] != settings["CREDENTIAL_VERSION"]:
@@ -151,18 +172,32 @@ def authenticated(settings: dict[str, Any], token: str) -> bool:
     if not TOKEN_RE.fullmatch(token):
         return False
     now = time.time()
-    with closing(connect(settings["DATABASE_PATH"])) as db, db:
-        cursor = db.execute(
-            "UPDATE admin_sessions SET last_seen=? WHERE token_hash=? AND expires_at>? AND last_seen>? "
+    with translate_database_busy(), closing(connect(settings["DATABASE_PATH"])) as db:
+        row = db.execute(
+            "SELECT last_seen FROM admin_sessions WHERE token_hash=? AND expires_at>? AND last_seen>? "
             "AND credential_version=? AND credential_version="
             "(SELECT value FROM security_state WHERE key='admin_credentials')",
-            (now, _token_hash(token), now, now - settings["ADMIN_IDLE_SECONDS"], settings["CREDENTIAL_VERSION"]),
-        )
-        return cursor.rowcount == 1
+            (_token_hash(token), now, now - settings["ADMIN_IDLE_SECONDS"], settings["CREDENTIAL_VERSION"]),
+        ).fetchone()
+        if row is None:
+            return False
+        # Avoid taking a SQLite writer lock on every authenticated page or CSV chunk.
+        touch_interval = max(0.1, min(60.0, settings["ADMIN_IDLE_SECONDS"] / 4))
+        if float(row["last_seen"]) <= now - touch_interval:
+            with db:
+                cursor = db.execute(
+                    "UPDATE admin_sessions SET last_seen=? WHERE token_hash=? AND expires_at>? AND last_seen>? "
+                    "AND credential_version=? AND credential_version="
+                    "(SELECT value FROM security_state WHERE key='admin_credentials')",
+                    (now, _token_hash(token), now, now - settings["ADMIN_IDLE_SECONDS"],
+                     settings["CREDENTIAL_VERSION"]),
+                )
+                return cursor.rowcount == 1
+        return True
 
 
 def revoke_sessions(settings: dict[str, Any], token: str | None = None) -> None:
-    with closing(connect(settings["DATABASE_PATH"])) as db, db:
+    with translate_database_busy(), closing(connect(settings["DATABASE_PATH"])) as db, db:
         if token is None:
             db.execute("DELETE FROM admin_sessions")
         elif TOKEN_RE.fullmatch(token):
@@ -176,7 +211,7 @@ def consume_rate(settings: dict[str, Any], action: str, client: str) -> int:
     window = settings[f"{prefix}_RATE_WINDOW"]
     limit = settings[f"{prefix}_RATE_LIMIT"]
     bucket = action + ":" + hmac.new(settings["SECRET_KEY"].encode(), client.encode(), hashlib.sha256).hexdigest()
-    with closing(connect(settings["DATABASE_PATH"])) as db, db:
+    with translate_database_busy(), closing(connect(settings["DATABASE_PATH"])) as db, db:
         db.execute("BEGIN IMMEDIATE")
         db.execute("DELETE FROM rate_limits WHERE expires_at<=?", (now,))
         row = db.execute("SELECT count,expires_at FROM rate_limits WHERE bucket=?", (bucket,)).fetchone()
@@ -200,9 +235,14 @@ class AdminGate:
             await self.app(scope, receive, send)
             return
         request = Request(scope, receive)
-        request.state.admin_authenticated = await anyio.to_thread.run_sync(
-            authenticated, self.settings, request.cookies.get(ADMIN_COOKIE, "")
-        )
+        try:
+            request.state.admin_authenticated = await anyio.to_thread.run_sync(
+                authenticated, self.settings, request.cookies.get(ADMIN_COOKIE, "")
+            )
+        except DatabaseBusyError:
+            await PlainTextResponse("Сервис временно занят. Повторите запрос.", 503,
+                                    headers={"Retry-After": "1"})(scope, receive, send)
+            return
         path = scope["path"]
         if (path == "/admin" or path.startswith("/admin/")) and path != "/admin/login":
             if not request.state.admin_authenticated:
@@ -211,9 +251,14 @@ class AdminGate:
         if scope["method"] == "POST" and path in {"/admin/login", "/checkout"}:
             # Uvicorn resolves trusted proxies; never inspect arbitrary forwarding headers here.
             client = scope.get("client") or ("unknown", 0)
-            retry = await anyio.to_thread.run_sync(
-                consume_rate, self.settings, "login" if path == "/admin/login" else "checkout", str(client[0])
-            )
+            try:
+                retry = await anyio.to_thread.run_sync(
+                    consume_rate, self.settings, "login" if path == "/admin/login" else "checkout", str(client[0])
+                )
+            except DatabaseBusyError:
+                await PlainTextResponse("Сервис временно занят. Повторите запрос.", 503,
+                                        headers={"Retry-After": "1"})(scope, receive, send)
+                return
             if retry:
                 await PlainTextResponse("Слишком много запросов. Повторите позже.", 429,
                                         headers={"Retry-After": str(retry)})(scope, receive, send)
@@ -242,6 +287,14 @@ class BodyLimitExceeded(MultiPartException):
 
 class MultipartBudgetExceeded(MultiPartException):
     pass
+
+
+class BodyReceiveTimeout(RuntimeError):
+    """The peer stopped progressing or exceeded the fixed request deadline."""
+
+
+class BodyReceiveDisconnected(RuntimeError):
+    """The peer disconnected before completing the request body."""
 
 
 class BoundedFormParser(FormParser):
@@ -326,8 +379,8 @@ class BoundedMultiPartParser(MultiPartParser):
 
 class SecurityEnvelope:
     """Wrap even ServerErrorMiddleware so every response has security headers."""
-    def __init__(self, app: Any) -> None:
-        self.app = app
+    def __init__(self, app: Any, settings: dict[str, Any]) -> None:
+        self.app, self.settings = app, settings
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -338,24 +391,48 @@ class SecurityEnvelope:
             LOGIN_BODY_BYTES if path == "/admin/login" else FORM_BODY_BYTES)
         total = 0
         exceeded = False
+        timed_out = False
         started = False
+        body_complete = False
+        started_at = anyio.current_time()
+        if path == "/admin/import":
+            idle_seconds = self.settings["IMPORT_BODY_IDLE_SECONDS"]
+            total_seconds = self.settings["IMPORT_BODY_TOTAL_SECONDS"]
+        else:
+            idle_seconds = self.settings["FORM_BODY_IDLE_SECONDS"]
+            total_seconds = self.settings["FORM_BODY_TOTAL_SECONDS"]
+        deadline = started_at + total_seconds
 
         async def bounded_receive() -> dict:
-            nonlocal total, exceeded
-            message = await receive()
+            nonlocal total, exceeded, body_complete, timed_out
+            remaining = deadline - anyio.current_time()
+            if remaining <= 0:
+                timed_out = True
+                raise BodyReceiveTimeout("Request body total deadline exceeded")
+            try:
+                with anyio.fail_after(min(idle_seconds, remaining)):
+                    message = await receive()
+            except TimeoutError as exc:
+                timed_out = True
+                raise BodyReceiveTimeout("Request body receive deadline exceeded") from exc
+            if message["type"] == "http.disconnect" and not body_complete:
+                timed_out = True
+                raise BodyReceiveDisconnected("Client disconnected before completing request body")
             if message["type"] == "http.request":
                 total += len(message.get("body", b""))
                 if total > limit:
                     exceeded = True
                     raise BodyLimitExceeded("Request body exceeds the allowed budget")
+                if not message.get("more_body", False):
+                    body_complete = True
             return message
 
         async def secure_send(message: dict) -> None:
             nonlocal started
             if message["type"] == "http.response.start":
                 started = True
-                if exceeded:
-                    message = {"type": "http.response.start", "status": 413, "headers": []}
+                if exceeded or timed_out:
+                    message = {"type": "http.response.start", "status": 413 if exceeded else 408, "headers": []}
                 headers = MutableHeaders(scope=message)
                 headers["X-Content-Type-Options"] = "nosniff"
                 headers["X-Frame-Options"] = "DENY"
@@ -369,6 +446,8 @@ class SecurityEnvelope:
                     headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
             elif message["type"] == "http.response.body" and exceeded:
                 message = {"type": "http.response.body", "body": b"Request body too large", "more_body": False}
+            elif message["type"] == "http.response.body" and timed_out:
+                message = {"type": "http.response.body", "body": b"Request timeout", "more_body": False}
             await send(message)
 
         raw_length = Headers(scope=scope).get("content-length")
@@ -384,8 +463,15 @@ class SecurityEnvelope:
         except BodyLimitExceeded:
             if not started:
                 await PlainTextResponse("Request body too large", 413)(scope, receive, secure_send)
+        except (BodyReceiveTimeout, BodyReceiveDisconnected):
+            if not started:
+                await PlainTextResponse("Request timeout", 408)(scope, receive, secure_send)
 
 
 class SecureFastAPI(FastAPI):
+    def __init__(self, *args: Any, security_settings: dict[str, Any], **kwargs: Any) -> None:
+        self.security_settings = security_settings
+        super().__init__(*args, **kwargs)
+
     def build_middleware_stack(self) -> Any:
-        return SecurityEnvelope(super().build_middleware_stack())
+        return SecurityEnvelope(super().build_middleware_stack(), self.security_settings)

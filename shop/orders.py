@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .database import connect
+from .database import connect, translate_database_busy
 from .telegram import send_order_notification
 
 LOGGER = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ field. A new key creates a new intentional order in the same guest session.
     key_hash = hashlib.sha256(idempotency_key.encode("ascii")).hexdigest()
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     payload_hash = hashlib.sha256(encoded.encode("ascii")).hexdigest()
-    with closing(connect(database_path)) as db, db:
+    with translate_database_busy(), closing(connect(database_path)) as db, db:
         # Serialize the check-and-create across processes as well as threads.
         db.execute("BEGIN IMMEDIATE")
         existing = db.execute(
